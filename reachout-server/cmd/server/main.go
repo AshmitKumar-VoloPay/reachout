@@ -3,47 +3,56 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ashmit/reachout-server/internal/config"
+	"github.com/ashmit/reachout-server/internal/db"
+	"github.com/ashmit/reachout-server/internal/httpapi"
+	"github.com/ashmit/reachout-server/migrations"
 )
 
 func main() {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal("DATABASE_URL is required")
+	if err := run(); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
 	}
-	addr := os.Getenv("ADDR")
-	if addr == "" {
-		addr = ":8080"
+}
+
+func run() error {
+	cfg, err := config.Load(os.Getenv)
+	if err != nil {
+		return err
 	}
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	slog.SetDefault(log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, dsn)
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("db: %v", err)
+		return err
 	}
 	defer pool.Close()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		c, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		if err := pool.Ping(c); err != nil {
-			http.Error(w, "db down", http.StatusServiceUnavailable)
-			return
-		}
-		w.Write([]byte("ok"))
-	})
+	applied, err := db.Migrate(ctx, pool, migrations.FS)
+	if err != nil {
+		return err
+	}
+	log.Info("migrations", "applied", applied)
 
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	_, handler := httpapi.NewRouter(httpapi.Deps{DB: pool, Log: log})
+	srv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		sc, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -51,8 +60,9 @@ func main() {
 		srv.Shutdown(sc)
 	}()
 
-	log.Printf("listening on %s", addr)
+	log.Info("listening", "addr", cfg.Addr, "worker_enabled", cfg.WorkerEnabled)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+		return err
 	}
+	return nil
 }
