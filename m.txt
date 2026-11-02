@@ -1,0 +1,98 @@
+LINKEDIN SALES TOOL - PROJECT SUMMARY
+
+PROBLEM
+Small sales teams and founders do LinkedIn outreach by hand: search prospects,
+send connection requests, wait, message, follow up, track replies. It takes
+hours a day, nothing is tracked, follow-ups get forgotten, leads go cold.
+Existing tools are expensive or complicated.
+
+SOLUTION
+A small multi-user web app where a user:
+  1. connects their LinkedIn account
+  2. builds a lead list from a LinkedIn search or profile URLs
+  3. launches a sequence: connect -> message -> follow-up
+  4. sees replies and results in one inbox + dashboard
+It can also be driven from Claude (or any AI client) through our own MCP
+connector.
+
+STACK (decided)
+  Backend:   Go
+  Frontend:  React (Vite)
+  Database:  Postgres
+  LinkedIn:  Linked API (REST) - https://linkedapi.io/docs
+  OAuth:     fosite, inside the Go app
+  MCP:       our own MCP server (Streamable HTTP) behind OAuth, used as a
+             Claude custom connector
+
+HOW LINKED API IS USED
+  - Admin API (linked-api-token header): connection sessions, accounts, seats,
+    limits, webhooks
+  - Account endpoints (identification-token header, one per connected
+    account): workflows (search, connect, message)
+  - Webhooks: results, account status changes, new messages. Dedupe by event
+    id; ordering is not guaranteed.
+  - Their MCP (67 tools) is single-tenant and for one operator. We use it only
+    as a dev tool to explore workflows, not in the product.
+
+ARCHITECTURE
+  React FE ----+
+               +--> Go service layer --> Postgres --> Linked API
+  Claude/AI ---+    (campaigns, leads,       ^
+   via our MCP       scheduler, state)       |
+                                       webhooks back
+
+WORKING-HOURS RULES (weekdays only)
+  Per account: timezone, working days (Mon-Fri), window (09:30-17:30),
+  daily caps with ramp-up for new accounts, optional holidays.
+  - Outbound actions only inside the window; otherwise pushed to next slot
+  - Delays count in business days
+  - Random jitter between actions
+  - Inbound webhooks processed 24/7; only sending is gated
+  - One function, NextSlot(now, schedule), used by app, MCP and worker
+
+LEAD STATE MACHINE
+  queued -> request_sent -> connected -> messaged -> followed_up
+         -> replied | done | failed
+
+OUR MCP TOOLS (scoped to the OAuth user)
+  list_accounts, get_connect_link, import_leads, list_leads, create_campaign,
+  start_campaign, pause_campaign, get_campaign_stats, get_replies,
+  reply_to_lead, get_schedule, set_schedule
+
+OAUTH (fosite)
+  Authorize + token (PKCE) + register (dynamic client registration) endpoints,
+  /.well-known/oauth-protected-resource and
+  /.well-known/oauth-authorization-server, 401 with WWW-Authenticate.
+  Claude callback: https://claude.ai/api/mcp/auth_callback
+  Scopes: campaigns:read, campaigns:write, leads:write, messages:send
+  Connectors need a public HTTPS URL (use a tunnel for dev).
+
+MVP SCOPE
+  In:  auth, LinkedIn connect/reconnect, lead import, 3-step campaign,
+       working-hours scheduler, reply inbox, stats dashboard, MCP server
+  Out: Sales Navigator, AI-written messages, team roles, billing/seat resale,
+       post engagement
+
+BUILD PHASES
+  1. (optional) Prototype with Linked API's MCP to learn workflow payloads
+  2. Foundation: Go, Postgres, users, linkedin client, schedule package + tests
+  3. Connect flow
+  4. Leads and campaigns
+  5. Worker (weekday/working-hours scheduler, per-account queue, caps, jitter)
+  6. Webhooks and inbox
+  7. OAuth server (fosite)
+  8. MCP server
+  9. React app (alongside 3-6; consent screen in 7)
+  10. Test as a real Claude connector
+
+RISKS / OPEN QUESTIONS
+  - Linked API is unofficial; it drives real browsers, which LinkedIn's terms
+    prohibit. User accounts could be restricted. Be upfront with users.
+  - Unverified: connection-session UX (hosted vs embedded), exact workflow
+    payloads, whether resale to your own customers is allowed, per-seat price.
+  - Seat-based billing: each connected account = 1 seat.
+
+CURRENT STATUS
+  Plan finalized. Go is NOT installed on this machine (brew install go).
+  Postgres not checked. Nothing scaffolded yet. Next: phase 2 once Go is
+  installed.
