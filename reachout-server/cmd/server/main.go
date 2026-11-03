@@ -19,6 +19,7 @@ import (
 	"github.com/ashmit/reachout-server/internal/httpapi"
 	"github.com/ashmit/reachout-server/internal/leads"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/worker"
 	"github.com/ashmit/reachout-server/migrations"
 )
 
@@ -70,7 +71,14 @@ func run() error {
 	accountsSvc := accounts.NewService(pool, li, cipher, log)
 	accounts.NewHandler(accountsSvc, authH, log).Register(mux)
 	leads.NewHandler(leads.NewService(pool, li, accountsSvc, log), authH, log).Register(mux)
-	campaigns.NewHandler(campaigns.NewService(pool, accountsSvc, log), authH, log).Register(mux)
+	campaignsSvc := campaigns.NewService(pool, accountsSvc, log)
+	campaigns.NewHandler(campaignsSvc, authH, log).Register(mux)
+
+	// The worker is the only code that acts on LinkedIn accounts. WORKER_ENABLED=false
+	// leaves the API running but sends nothing.
+	workerCfg := worker.DefaultConfig()
+	workerCfg.Enabled = cfg.WorkerEnabled
+	go worker.New(pool, accountsSvc, campaignsSvc, li, workerCfg, log).Run(ctx)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
