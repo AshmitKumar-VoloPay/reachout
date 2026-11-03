@@ -220,6 +220,10 @@ func (w *Worker) classifyCompletion(kind string, completion json.RawMessage) out
 // workers, or a retry after a crash) cannot apply an outcome twice.
 func (w *Worker) settle(ctx context.Context, a attempt, o outcome) {
 	now := w.now()
+	if isSync(a.kind) {
+		w.settleSync(ctx, a, o, now)
+		return
+	}
 	switch o.kind {
 	case outSuccess:
 		w.settleSuccess(ctx, a, o, now)
@@ -247,6 +251,43 @@ func (w *Worker) settle(ctx context.Context, a attempt, o outcome) {
 				w.log.Error("mark account", "account", a.accountID, "err", err)
 			}
 		}
+	}
+}
+
+// settleSync finishes a sync task. It touches no lead. A failure is simply recorded: the
+// next try comes after syncRetry, and sending stays off until both syncs have succeeded.
+func (w *Worker) settleSync(ctx context.Context, a attempt, o outcome, now time.Time) {
+	switch o.kind {
+	case outSuccess:
+		if !w.closeAttempt(ctx, a, statusSucceeded, "", now) {
+			return
+		}
+		col := "network_synced_at"
+		if a.kind == kindSyncInbox {
+			col = "inbox_synced_at"
+		}
+		if _, err := w.pool.Exec(ctx, `UPDATE linkedin_accounts SET `+col+` = $1 WHERE id = $2`, now, a.accountID); err != nil {
+			w.log.Error("mark synced", "account", a.accountID, "kind", a.kind, "err", err)
+			return
+		}
+		if sched, err := w.acc.LoadSchedule(ctx, a.accountID); err == nil {
+			if err := w.acc.SetNotBefore(ctx, a.accountID, w.jitter(sched, now, w.cfg.MinGap, w.cfg.MaxGap)); err != nil {
+				w.log.Error("set spacing", "account", a.accountID, "err", err)
+			}
+		}
+		w.log.Info("event feed enabled", "account", a.accountID, "kind", a.kind)
+	case outAccountProblem:
+		if w.closeAttempt(ctx, a, statusFailed, o.detail, now) {
+			if err := w.acc.MarkNeedsAttention(ctx, a.accountID, o.accountSt, o.detail); err != nil {
+				w.log.Error("mark account", "account", a.accountID, "err", err)
+			}
+		}
+	default:
+		detail := o.detail
+		if detail == "" {
+			detail = "sync did not complete"
+		}
+		w.closeAttempt(ctx, a, statusFailed, detail, now)
 	}
 }
 

@@ -1,8 +1,12 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +15,7 @@ import (
 	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/linkedin"
 	"github.com/ashmit/reachout-server/internal/schedule"
+	"github.com/ashmit/reachout-server/internal/webhooks"
 )
 
 var longAgo = utc(2026, 11, 2, 8, 0)
@@ -877,5 +882,301 @@ func TestOnlyRealSendsUseUpTheCap(t *testing.T) {
 	}
 	if used[schedule.KindConnect] != 1 || used[schedule.KindMessage] != 1 {
 		t.Fatalf("used today: %v, want 1 connect (failed and yesterday excluded) and 1 message (unknown counts)", used)
+	}
+}
+
+func actionTypes(e *env) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []string
+	for _, s := range e.sent {
+		out = append(out, s.action["actionType"].(string))
+	}
+	return out
+}
+
+func syncedAt(e *env, accountID int64) (network, inbox bool) {
+	var n, i *time.Time
+	e.pool.QueryRow(context.Background(), `SELECT network_synced_at, inbox_synced_at FROM linkedin_accounts WHERE id = $1`, accountID).Scan(&n, &i)
+	return n != nil, i != nil
+}
+
+func TestEventFeedsAreSwitchedOnBeforeAnySend(t *testing.T) {
+	e := newEnv(t)
+	u := e.user("a@example.com")
+	acct := e.account(u)
+	e.markSynced(acct, false)
+	e.caps(u, acct, 1, 10) // one request a day: sync tasks must not use it up
+	c := e.campaign(u, acct, "p", 1, 10, longAgo)
+	w := e.worker(testConfig())
+
+	e.tick(w, utc(2026, 11, 10, 10, 0))
+	if got := fmt.Sprint(actionTypes(e)); got != "[st.syncNetwork]" {
+		t.Fatalf("first task: %s (nothing may be sent before the feeds are on)", got)
+	}
+	e.tick(w, utc(2026, 11, 10, 10, 1))
+	if n, i := syncedAt(e, acct); !n || i {
+		t.Fatalf("after the first result: network=%v inbox=%v", n, i)
+	}
+	e.tick(w, utc(2026, 11, 10, 10, 2)) // inside the spacing gap
+	if len(actionTypes(e)) != 1 {
+		t.Fatalf("started a task inside the gap: %v", actionTypes(e))
+	}
+	e.tick(w, utc(2026, 11, 10, 10, 5))
+	e.tick(w, utc(2026, 11, 10, 10, 6))
+	if n, i := syncedAt(e, acct); !n || !i {
+		t.Fatalf("both feeds should be on: network=%v inbox=%v", n, i)
+	}
+	if l := e.lead(c.id, c.leads[0]); l.state != campaigns.StateQueued {
+		t.Fatalf("lead was contacted before the feeds were on: %s", l.state)
+	}
+
+	e.tick(w, utc(2026, 11, 10, 10, 10))
+	e.tick(w, utc(2026, 11, 10, 10, 11))
+	if got := fmt.Sprint(actionTypes(e)); got != "[st.syncNetwork st.syncInbox st.sendConnectionRequest]" {
+		t.Fatalf("task order: %s", got)
+	}
+	if l := e.lead(c.id, c.leads[0]); l.state != campaigns.StateRequestSent {
+		t.Fatalf("lead after the feeds were on: %+v", l)
+	}
+	// Sync tasks are not sends: the daily request cap of 1 was still available for the real one.
+	// And they are never repeated once done.
+	before := len(actionTypes(e))
+	e.runDay(w, 11, 4*time.Minute)
+	e.runDay(w, 12, 4*time.Minute)
+	for _, a := range actionTypes(e)[before:] {
+		if strings.HasPrefix(a, "st.sync") {
+			t.Fatalf("sync repeated: %s", a)
+		}
+	}
+}
+
+func TestSyncWaitsForWorkingHours(t *testing.T) {
+	e := newEnv(t)
+	u := e.user("a@example.com")
+	acct := e.account(u)
+	e.markSynced(acct, false)
+	e.campaign(u, acct, "p", 1, 10, longAgo)
+	w := e.worker(testConfig())
+
+	for _, at := range []time.Time{utc(2026, 11, 7, 12, 0), utc(2026, 11, 8, 12, 0), utc(2026, 11, 10, 3, 0), utc(2026, 11, 10, 18, 0)} {
+		e.tick(w, at)
+	}
+	if e.sentCount() != 0 {
+		t.Fatalf("sync started outside working hours: %v", actionTypes(e))
+	}
+	e.tick(w, utc(2026, 11, 9, 11, 0)) // Monday
+	if fmt.Sprint(actionTypes(e)) != "[st.syncNetwork]" {
+		t.Fatalf("Monday: %v", actionTypes(e))
+	}
+}
+
+func TestSyncFailureBacksOffAndBlocksSending(t *testing.T) {
+	e := newEnv(t)
+	u := e.user("a@example.com")
+	acct := e.account(u)
+	e.markSynced(acct, false)
+	c := e.campaign(u, acct, "p", 1, 10, longAgo)
+	w := e.worker(testConfig())
+
+	e.setResults(func(sentAction) linkedin.WorkflowResult { return actionError("somethingWentWrong") })
+	e.tick(w, utc(2026, 11, 10, 10, 0))
+	e.tick(w, utc(2026, 11, 10, 10, 1)) // the task failed
+	if got := e.attemptCounts(acct); got["failed"] != 1 {
+		t.Fatalf("attempts: %v", got)
+	}
+	// The backoff is per task: the inbox sync gets its own first try, but neither task is
+	// repeated inside 30 minutes.
+	for _, m := range []int{5, 6, 15, 29} {
+		e.tick(w, utc(2026, 11, 10, 10, m))
+	}
+	if got := fmt.Sprint(actionTypes(e)); got != "[st.syncNetwork st.syncInbox]" {
+		t.Fatalf("tasks inside the 30 minute backoff: %s", got)
+	}
+	e.setResults(func(sentAction) linkedin.WorkflowResult { return ok() })
+	e.tick(w, utc(2026, 11, 10, 10, 31)) // the network sync is retried
+	if got := actionTypes(e); len(got) != 3 || got[2] != "st.syncNetwork" {
+		t.Fatalf("no retry after the backoff: %v", got)
+	}
+	// Throughout, the lead was never contacted.
+	if l := e.lead(c.id, c.leads[0]); l.state != campaigns.StateQueued {
+		t.Fatalf("lead state %s while the feeds were off", l.state)
+	}
+}
+
+func TestSignedOutDuringSyncFlagsTheAccount(t *testing.T) {
+	e := newEnv(t)
+	u := e.user("a@example.com")
+	acct := e.account(u)
+	e.markSynced(acct, false)
+	e.campaign(u, acct, "p", 1, 10, longAgo)
+	e.setResults(func(sentAction) linkedin.WorkflowResult {
+		return linkedin.WorkflowResult{Status: "failed", Failure: &linkedin.WorkflowFailure{Reason: "linkedinAccountSignedOut"}}
+	})
+	w := e.worker(testConfig())
+	e.tick(w, utc(2026, 11, 10, 10, 0))
+	e.tick(w, utc(2026, 11, 10, 10, 1))
+	var status string
+	e.pool.QueryRow(context.Background(), `SELECT status FROM linkedin_accounts WHERE id = $1`, acct).Scan(&status)
+	if status != "reconnection_required" {
+		t.Fatalf("status %q", status)
+	}
+}
+
+func TestAnAccountThatIsAlreadySyncedGetsNoSyncTasks(t *testing.T) {
+	e := newEnv(t)
+	u := e.user("a@example.com")
+	acct := e.account(u) // helper marks the feeds as on
+	e.campaign(u, acct, "p", 2, 10, longAgo)
+	w := e.worker(testConfig())
+	e.runDay(w, 10, 4*time.Minute)
+	for _, a := range actionTypes(e) {
+		if strings.HasPrefix(a, "st.sync") {
+			t.Fatalf("unexpected %s", a)
+		}
+	}
+}
+
+// ---- replies arriving through the real webhook endpoint ----
+
+const hookSecret = "test-webhook-secret"
+
+// webhook returns a function that delivers an event to the real webhook handler, signed.
+func (e *env) webhook() func(typ string, data map[string]any) int {
+	mux := http.NewServeMux()
+	webhooks.New(e.pool, e.camps, hookSecret, nil).Register(mux)
+	n := 0
+	return func(typ string, data map[string]any) int {
+		n++
+		body, _ := json.Marshal(map[string]any{"id": fmt.Sprintf("hook-%d", n), "type": typ,
+			"createdAt": time.Now().Format(time.RFC3339), "data": data})
+		ts, sig := webhooks.Sign(hookSecret, body, time.Now())
+		req := httptest.NewRequest("POST", "/webhooks/linkedapi", bytes.NewReader(body))
+		req.Header.Set(webhooks.TimestampHeader, ts)
+		req.Header.Set(webhooks.SignatureHeader, sig)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+}
+
+func (e *env) linkedInID(accountID int64) string {
+	var id string
+	e.pool.QueryRow(context.Background(), `SELECT linkedin_account_id FROM linkedin_accounts WHERE id = $1`, accountID).Scan(&id)
+	return id
+}
+
+func replyData(laID, url string) map[string]any {
+	return map[string]any{"accountId": laID, "sender": "them", "text": "I'm interested", "messageId": "m-" + url,
+		"personPublicUrl": url, "time": time.Now().Format(time.RFC3339)}
+}
+
+func TestAReplyStopsFurtherSendsAtEveryStep(t *testing.T) {
+	e := newEnv(t)
+	u := e.user("a@example.com")
+	acct := e.account(u)
+	e.caps(u, acct, 30, 100)
+	ctx := context.Background()
+	c := e.campaign(u, acct, "p", 3, 30, longAgo)
+	// Lead 0 is waiting to get its connection request, lead 1 its first message, lead 2 its follow-up.
+	e.camps.Record(ctx, c.id, c.leads[1], campaigns.EvRequestSent, utc(2026, 11, 9, 10, 0), "")
+	e.camps.Record(ctx, c.id, c.leads[1], campaigns.EvAccepted, utc(2026, 11, 9, 10, 0), "")
+	for _, ev := range []campaigns.Event{campaigns.EvRequestSent, campaigns.EvAccepted, campaigns.EvMessageSent} {
+		e.camps.Record(ctx, c.id, c.leads[2], ev, utc(2026, 11, 9, 10, 0), "")
+	}
+	e.setDue(c.id, longAgo)
+
+	post := e.webhook()
+	la := e.linkedInID(acct)
+	for i := range c.leads {
+		if code := post("inbox.messageReceived", replyData(la, leadURL("p", i))); code != 200 {
+			t.Fatalf("webhook for lead %d: %d", i, code)
+		}
+	}
+	w := e.worker(testConfig())
+	e.runDay(w, 10, 4*time.Minute)
+	if e.sentCount() != 0 {
+		t.Fatalf("sent %d actions to people who had replied: %v", e.sentCount(), actionTypes(e))
+	}
+	for _, id := range c.leads {
+		if l := e.lead(c.id, id); l.state != campaigns.StateReplied || l.due != nil {
+			t.Fatalf("lead %d: %+v", id, l)
+		}
+	}
+}
+
+func TestAReplyThatArrivesWhileAMessageIsInFlight(t *testing.T) {
+	e := newEnv(t)
+	u := e.user("a@example.com")
+	acct := e.account(u)
+	ctx := context.Background()
+	c := e.campaign(u, acct, "p", 1, 30, longAgo)
+	e.camps.Record(ctx, c.id, c.leads[0], campaigns.EvRequestSent, utc(2026, 11, 9, 10, 0), "")
+	e.camps.Record(ctx, c.id, c.leads[0], campaigns.EvAccepted, utc(2026, 11, 9, 10, 0), "")
+	e.setDue(c.id, longAgo)
+	w := e.worker(testConfig())
+
+	e.tick(w, utc(2026, 11, 10, 10, 0)) // the message is submitted
+	if fmt.Sprint(actionTypes(e)) != "[st.sendMessage]" {
+		t.Fatalf("actions: %v", actionTypes(e))
+	}
+	// Before LinkedIn finishes, the person's reply comes in.
+	if code := e.webhook()("inbox.messageReceived", replyData(e.linkedInID(acct), leadURL("p", 0))); code != 200 {
+		t.Fatalf("webhook: %d", code)
+	}
+	e.tick(w, utc(2026, 11, 10, 10, 1)) // the message's result arrives afterwards
+
+	if l := e.lead(c.id, c.leads[0]); l.state != campaigns.StateReplied || l.due != nil {
+		t.Fatalf("lead: %+v (a reply must win over a send that finished later)", l)
+	}
+	if got := e.attemptCounts(acct); got["succeeded"] != 1 || got["submitted"] != 0 {
+		t.Fatalf("attempts: %v", got)
+	}
+	// The message really was sent, so it is in the conversation, and the person's reply too.
+	var out, in int
+	e.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE direction = 'out'), count(*) FILTER (WHERE direction = 'in') FROM messages WHERE lead_id = $1`, c.leads[0]).Scan(&out, &in)
+	if out != 1 || in != 1 {
+		t.Fatalf("messages: %d out, %d in", out, in)
+	}
+	e.runDay(w, 11, 4*time.Minute)
+	if len(actionTypes(e)) != 1 {
+		t.Fatalf("kept sending after the reply: %v", actionTypes(e))
+	}
+}
+
+func TestAnAcceptanceWebhookMakesTheMessageDue(t *testing.T) {
+	e := newEnv(t)
+	u := e.user("a@example.com")
+	acct := e.account(u)
+	c := e.campaign(u, acct, "p", 1, 30, longAgo)
+	w := e.worker(testConfig())
+	e.tick(w, utc(2026, 11, 10, 10, 0))
+	e.tick(w, utc(2026, 11, 10, 10, 1)) // request sent
+	if l := e.lead(c.id, c.leads[0]); l.state != campaigns.StateRequestSent || l.due != nil {
+		t.Fatalf("setup: %+v", l)
+	}
+	// Nothing happens until LinkedIn reports the acceptance.
+	e.runDay(w, 11, 4*time.Minute)
+	if len(actionTypes(e)) != 1 {
+		t.Fatalf("worker did something while waiting: %v", actionTypes(e))
+	}
+	code := e.webhook()("network.connectionAccepted", map[string]any{
+		"accountId": e.linkedInID(acct), "personUrl": leadURL("p", 0), "detectedAt": time.Now().Format(time.RFC3339)})
+	if code != 200 {
+		t.Fatalf("webhook: %d", code)
+	}
+	l := e.lead(c.id, c.leads[0])
+	if l.state != campaigns.StateConnected || l.due == nil {
+		t.Fatalf("after acceptance: %+v", l)
+	}
+	sched, _ := e.accts.LoadSchedule(context.Background(), acct)
+	if !sched.IsOpen(*l.due) {
+		t.Fatalf("message due at %v, which is outside working hours", l.due)
+	}
+	// The webhook handler uses the real clock, so its due time is earlier than this test's
+	// fake timeline: on a later fake day the message is due, and the worker sends it.
+	e.tick(w, utc(2026, 11, 11, 10, 30))
+	if got := actionTypes(e); len(got) != 2 || got[1] != "st.sendMessage" {
+		t.Fatalf("actions: %v", got)
 	}
 }

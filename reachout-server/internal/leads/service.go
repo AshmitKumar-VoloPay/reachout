@@ -81,7 +81,7 @@ type ImportResult struct {
 	Invalid    []InvalidURL `json:"invalid"`
 }
 
-type candidate struct{ url, name, headline string }
+type candidate struct{ url, name, headline, urn string }
 
 // ImportURLs adds the profile URLs found in the pasted text. Different spellings of the
 // same profile count once; people already in the user's leads count as duplicates.
@@ -154,12 +154,13 @@ func (s *Service) insert(ctx context.Context, tx pgx.Tx, userID int64, cands []c
 		}
 		var inserted bool
 		err := tx.QueryRow(ctx,
-			`INSERT INTO leads (user_id, profile_url, name, headline) VALUES ($1, $2, $3, $4)
+			`INSERT INTO leads (user_id, profile_url, name, headline, linkedin_urn) VALUES ($1, $2, $3, $4, nullif($5, ''))
 			 ON CONFLICT (user_id, profile_url) DO UPDATE
-			   SET name     = CASE WHEN leads.name = ''     THEN EXCLUDED.name     ELSE leads.name END,
-			       headline = CASE WHEN leads.headline = '' THEN EXCLUDED.headline ELSE leads.headline END
+			   SET name         = CASE WHEN leads.name = ''     THEN EXCLUDED.name     ELSE leads.name END,
+			       headline     = CASE WHEN leads.headline = '' THEN EXCLUDED.headline ELSE leads.headline END,
+			       linkedin_urn = coalesce(leads.linkedin_urn, EXCLUDED.linkedin_urn)
 			 RETURNING (xmax = 0)`,
-			userID, c.url, c.name, c.headline).Scan(&inserted)
+			userID, c.url, c.name, c.headline, c.urn).Scan(&inserted)
 		if err != nil {
 			return err
 		}

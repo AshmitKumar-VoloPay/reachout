@@ -62,6 +62,9 @@ func TestLoadLinkedAPIAndKey(t *testing.T) {
 			t.Errorf("%s: expected error", name)
 		}
 	}
+	if c, err := Load(env(map[string]string{"DATABASE_URL": "x", "LINKED_API_WEBHOOK_SECRET": " s3cret\n"})); err != nil || c.WebhookSecret != "s3cret" {
+		t.Fatalf("webhook secret: %+v %v", c, err)
+	}
 	// Unset is allowed here; the server refuses to start without them.
 	if c, err := Load(env(map[string]string{"DATABASE_URL": "x"})); err != nil || c.TokenKey != nil || c.LinkedAPIToken != "" {
 		t.Fatalf("%+v %v", c, err)

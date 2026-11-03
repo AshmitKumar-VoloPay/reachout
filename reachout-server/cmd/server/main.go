@@ -17,8 +17,10 @@ import (
 	"github.com/ashmit/reachout-server/internal/config"
 	"github.com/ashmit/reachout-server/internal/db"
 	"github.com/ashmit/reachout-server/internal/httpapi"
+	"github.com/ashmit/reachout-server/internal/inbox"
 	"github.com/ashmit/reachout-server/internal/leads"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/webhooks"
 	"github.com/ashmit/reachout-server/internal/worker"
 	"github.com/ashmit/reachout-server/migrations"
 )
@@ -73,6 +75,16 @@ func run() error {
 	leads.NewHandler(leads.NewService(pool, li, accountsSvc, log), authH, log).Register(mux)
 	campaignsSvc := campaigns.NewService(pool, accountsSvc, log)
 	campaigns.NewHandler(campaignsSvc, authH, log).Register(mux)
+
+	inbox.NewHandler(inbox.NewService(pool), authH, log).Register(mux)
+
+	// Linked API calls this endpoint when someone accepts a request or replies. It checks the
+	// signature itself, so it sits outside the cookie-based auth.
+	if cfg.WebhookSecret == "" {
+		log.Warn("LINKED_API_WEBHOOK_SECRET is not set: /webhooks/linkedapi will refuse all events, so accepted requests and replies will not be noticed")
+	}
+	webhooks.New(pool, campaignsSvc, cfg.WebhookSecret, log).Register(mux)
+	go webhooks.NewReconciler(pool, li, log).Run(ctx, 10*time.Minute)
 
 	// The worker is the only code that acts on LinkedIn accounts. WORKER_ENABLED=false
 	// leaves the API running but sends nothing.

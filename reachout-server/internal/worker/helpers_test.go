@@ -152,7 +152,21 @@ func (e *env) account(u user) int64 {
 		e.t.Fatalf("connect: %+v %v", got, err)
 	}
 	e.rampStart(acc.ID, "2020-01-01")
+	e.markSynced(acc.ID, true)
 	return acc.ID
+}
+
+// markSynced says whether Linked API's network and inbox feeds are already on for the
+// account. Most tests start with them on, so only the sync tests meet the gate.
+func (e *env) markSynced(accountID int64, on bool) {
+	e.t.Helper()
+	q := `UPDATE linkedin_accounts SET network_synced_at = NULL, inbox_synced_at = NULL WHERE id = $1`
+	if on {
+		q = `UPDATE linkedin_accounts SET network_synced_at = '2020-01-01', inbox_synced_at = '2020-01-01' WHERE id = $1`
+	}
+	if _, err := e.pool.Exec(context.Background(), q, accountID); err != nil {
+		e.t.Fatal(err)
+	}
 }
 
 func (e *env) rampStart(accountID int64, date string) {

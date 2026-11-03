@@ -174,6 +174,7 @@ func (s *Service) GetImport(ctx context.Context, userID, id int64) (Import, erro
 // searchItem is one person in a st.searchPeople result.
 type searchItem struct {
 	Name      string  `json:"name"`
+	URN       *string `json:"urn"`
 	PublicURL *string `json:"publicUrl"`
 	Headline  string  `json:"headline"`
 }
@@ -225,7 +226,11 @@ func (s *Service) applySearch(ctx context.Context, userID int64, imp Import, com
 			continue
 		}
 		seen[n] = true
-		cands = append(cands, candidate{url: n, name: truncate(it.Name, 200), headline: truncate(it.Headline, 500)})
+		urn := ""
+		if it.URN != nil {
+			urn = truncate(*it.URN, 200)
+		}
+		cands = append(cands, candidate{url: n, name: truncate(it.Name, 200), headline: truncate(it.Headline, 500), urn: urn})
 	}
 
 	err := s.inTx(ctx, userID, func(tx pgx.Tx) error {

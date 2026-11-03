@@ -23,6 +23,7 @@ type Config struct {
 
 	// Linked API. Both are validated here when set and required by the server at startup.
 	LinkedAPIToken   string
+	WebhookSecret    string // signing secret of the Linked API webhook; without it /webhooks refuses every request
 	LinkedAPIBaseURL string // empty means the public API
 	TokenKey         []byte // 32 bytes, from TOKEN_ENCRYPTION_KEY (base64)
 }
@@ -64,6 +65,7 @@ func Load(getenv func(string) string) (Config, error) {
 		c.CookieSecure = b
 	}
 	c.LinkedAPIToken = strings.TrimSpace(getenv("LINKED_API_TOKEN"))
+	c.WebhookSecret = strings.TrimSpace(getenv("LINKED_API_WEBHOOK_SECRET"))
 	c.LinkedAPIBaseURL = strings.TrimRight(strings.TrimSpace(getenv("LINKED_API_BASE_URL")), "/")
 	if v := strings.TrimSpace(getenv("TOKEN_ENCRYPTION_KEY")); v != "" {
 		key, err := base64.StdEncoding.DecodeString(v)

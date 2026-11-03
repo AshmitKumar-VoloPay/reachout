@@ -190,6 +190,33 @@ func (c *HTTPClient) ListAccounts(ctx context.Context) ([]Account, error) {
 	return out, nil
 }
 
+// ListWebhookDeliveries returns recent deliveries, newest first. The response key name is
+// not shown in Linked API's docs ("deliveries" is assumed); an unexpected shape yields an
+// empty list, which is safe: nothing gets replayed.
+func (c *HTTPClient) ListWebhookDeliveries(ctx context.Context) ([]Delivery, error) {
+	var r struct {
+		Deliveries []struct {
+			ID        string `json:"id"`
+			EventType string `json:"eventType"`
+			EventID   string `json:"eventId"`
+			Status    string `json:"status"`
+			Attempts  int    `json:"attempts"`
+		} `json:"deliveries"`
+	}
+	if err := c.admin(ctx, "webhook.deliveries", nil, &r); err != nil {
+		return nil, err
+	}
+	out := make([]Delivery, 0, len(r.Deliveries))
+	for _, d := range r.Deliveries {
+		out = append(out, Delivery{ID: d.ID, EventType: d.EventType, EventID: d.EventID, Status: d.Status, Attempts: d.Attempts})
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) ReplayWebhookDelivery(ctx context.Context, deliveryID string) error {
+	return c.admin(ctx, "webhook.replayDelivery", map[string]string{"deliveryId": deliveryID}, nil)
+}
+
 func (c *HTTPClient) StartWorkflow(ctx context.Context, identToken string, action map[string]any) (WorkflowStart, error) {
 	var r struct {
 		WorkflowID    string  `json:"workflowId"`

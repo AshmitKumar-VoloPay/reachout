@@ -376,7 +376,8 @@ func searchResult(people ...map[string]any) linkedin.WorkflowResult {
 }
 
 func person(name, url string) map[string]any {
-	return map[string]any{"name": name, "publicUrl": url, "headline": "CTO at Acme", "location": "London"}
+	return map[string]any{"name": name, "publicUrl": url, "headline": "CTO at Acme", "location": "London",
+		"urn": "urn:li:member:" + strings.ReplaceAll(strings.ToLower(name), " ", "-")}
 }
 
 func TestSearchImportLifecycle(t *testing.T) {
@@ -435,6 +436,12 @@ func TestSearchImportLifecycle(t *testing.T) {
 		u.id, profile("jane-doe")).Scan(&name, &headline)
 	if name != "Jane Doe" || headline != "CTO at Acme" {
 		t.Fatalf("lead data: %q %q", name, headline)
+	}
+	// The person's URN is kept so later events that name them only by URN still find them.
+	var urn *string
+	e.pool.QueryRow(context.Background(), `SELECT linkedin_urn FROM leads WHERE user_id = $1 AND profile_url = $2`, u.id, profile("jane-doe")).Scan(&urn)
+	if urn == nil || *urn != "urn:li:member:jane-doe" {
+		t.Fatalf("urn not stored: %v", urn)
 	}
 	// The pre-existing blank-name lead was enriched from the search result.
 	e.pool.QueryRow(context.Background(), `SELECT name FROM leads WHERE user_id = $1 AND profile_url = $2`, u.id, profile("existing")).Scan(&name)

@@ -10,13 +10,15 @@ import (
 // Drive it from a test: FinishSession completes a connection session, SetAccountStatus
 // changes an account, and Err makes the next call to a named method fail.
 type Fake struct {
-	mu       sync.Mutex
-	n        int
-	Accounts []Account
-	sessions map[string]string // session id -> status
-	Err      map[string]error  // method name -> error returned once
-	Calls    []string          // method names, in call order
-	Workflow func(token string, action map[string]any) (WorkflowStart, error)
+	mu         sync.Mutex
+	n          int
+	Accounts   []Account
+	Deliveries []Delivery
+	Replayed   []string
+	sessions   map[string]string // session id -> status
+	Err        map[string]error  // method name -> error returned once
+	Calls      []string          // method names, in call order
+	Workflow   func(token string, action map[string]any) (WorkflowStart, error)
 	// GetWorkflowFn overrides GetWorkflow's default "completed, success" answer.
 	GetWorkflowFn func(token, workflowID string) (WorkflowResult, error)
 }
@@ -90,6 +92,26 @@ func (f *Fake) ListAccounts(ctx context.Context) ([]Account, error) {
 		return nil, err
 	}
 	return append([]Account(nil), f.Accounts...), nil
+}
+
+// Deliveries is what ListWebhookDeliveries returns; Replayed lists replayed delivery ids.
+func (f *Fake) ListWebhookDeliveries(ctx context.Context) ([]Delivery, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.enter("ListWebhookDeliveries"); err != nil {
+		return nil, err
+	}
+	return append([]Delivery(nil), f.Deliveries...), nil
+}
+
+func (f *Fake) ReplayWebhookDelivery(ctx context.Context, deliveryID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.enter("ReplayWebhookDelivery"); err != nil {
+		return err
+	}
+	f.Replayed = append(f.Replayed, deliveryID)
+	return nil
 }
 
 func (f *Fake) StartWorkflow(ctx context.Context, token string, action map[string]any) (WorkflowStart, error) {

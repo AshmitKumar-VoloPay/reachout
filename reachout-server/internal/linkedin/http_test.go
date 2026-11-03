@@ -118,6 +118,28 @@ func TestWorkflowStartAndGet(t *testing.T) {
 	}
 }
 
+func TestWebhookDeliveries(t *testing.T) {
+	c, req, _ := server(t, 200, `{"success":true,"result":{"deliveries":[
+	  {"id":"d1","eventType":"network.connectionAccepted","eventId":"e1","status":"failed","attempts":8},
+	  {"id":"d2","eventType":"inbox.messageReceived","eventId":"e2","status":"success","attempts":1}]}}`)
+	ds, err := c.ListWebhookDeliveries(context.Background())
+	if err != nil || len(ds) != 2 || ds[0].Status != "failed" || ds[0].EventID != "e1" || ds[0].Attempts != 8 {
+		t.Fatalf("%+v %v", ds, err)
+	}
+	if req.URL.Path != "/admin/webhook.deliveries" {
+		t.Fatalf("path %s", req.URL.Path)
+	}
+	// An unexpected shape is an empty list, so nothing is replayed by mistake.
+	c, _, _ = server(t, 200, `{"success":true,"result":{"items":[{"id":"x","status":"failed"}]}}`)
+	if ds, err := c.ListWebhookDeliveries(context.Background()); err != nil || len(ds) != 0 {
+		t.Fatalf("unexpected shape: %+v %v", ds, err)
+	}
+	c, req, body := server(t, 200, `{"success":true,"result":{}}`)
+	if err := c.ReplayWebhookDelivery(context.Background(), "d1"); err != nil || req.URL.Path != "/admin/webhook.replayDelivery" || !strings.Contains(*body, `"deliveryId":"d1"`) {
+		t.Fatalf("replay: %v %s %s", err, req.URL.Path, *body)
+	}
+}
+
 func TestErrorMapping(t *testing.T) {
 	cases := []struct {
 		name   string

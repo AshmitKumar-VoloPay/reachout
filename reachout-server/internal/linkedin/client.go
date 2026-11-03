@@ -48,6 +48,15 @@ const (
 	SessionCancelled = "cancelled"
 )
 
+// Delivery is one attempt history entry of a webhook event.
+type Delivery struct {
+	ID        string
+	EventType string
+	EventID   string
+	Status    string // pending | delivering | success | failed
+	Attempts  int
+}
+
 type WorkflowStart struct {
 	ID            string
 	Status        string // pending | running
@@ -75,6 +84,10 @@ type Client interface {
 	GetConnectionSession(ctx context.Context, sessionID string) (status string, err error)
 	CancelConnectionSession(ctx context.Context, sessionID string) error
 	ListAccounts(ctx context.Context) ([]Account, error)
+
+	// Webhook delivery history (admin API). Used to replay deliveries Linked API gave up on.
+	ListWebhookDeliveries(ctx context.Context) ([]Delivery, error)
+	ReplayWebhookDelivery(ctx context.Context, deliveryID string) error
 
 	// Workflow API (also needs the account's identification token).
 	StartWorkflow(ctx context.Context, identificationToken string, action map[string]any) (WorkflowStart, error)

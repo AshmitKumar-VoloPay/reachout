@@ -32,7 +32,16 @@ const (
 	kindConnect  = "connect"
 	kindMessage  = "message"
 	kindFollowUp = "followup"
+
+	// Not sends: one-time tasks that switch on Linked API's event feeds for an account.
+	kindSyncNetwork = "sync_network"
+	kindSyncInbox   = "sync_inbox"
 )
+
+// syncRetry is how long to wait before trying a failed sync task again.
+const syncRetry = 30 * time.Minute
+
+func isSync(kind string) bool { return kind == kindSyncNetwork || kind == kindSyncInbox }
 
 // Attempt statuses (send_attempts.status).
 const (
@@ -163,14 +172,19 @@ func (w *Worker) Tick(ctx context.Context) {
 }
 
 func (w *Worker) accountsWithDueWork(ctx context.Context) ([]int64, error) {
+	// Accounts with a send due, plus connected accounts whose event feeds are not on yet.
 	rows, err := w.pool.Query(ctx,
-		`SELECT DISTINCT c.account_id
-		   FROM campaign_leads cl
-		   JOIN campaigns c ON c.id = cl.campaign_id
-		   JOIN linkedin_accounts a ON a.id = c.account_id
-		  WHERE c.status = 'running' AND a.status = 'connected'
-		    AND cl.state IN ('queued','connected','messaged') AND cl.next_action_at <= $1
-		  ORDER BY c.account_id`, w.now())
+		`SELECT account_id FROM (
+		    SELECT c.account_id
+		      FROM campaign_leads cl
+		      JOIN campaigns c ON c.id = cl.campaign_id
+		      JOIN linkedin_accounts a ON a.id = c.account_id
+		     WHERE c.status = 'running' AND a.status = 'connected'
+		       AND cl.state IN ('queued','connected','messaged') AND cl.next_action_at <= $1
+		    UNION
+		    SELECT id FROM linkedin_accounts
+		     WHERE status = 'connected' AND (network_synced_at IS NULL OR inbox_synced_at IS NULL)
+		  ) x ORDER BY account_id`, w.now())
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +267,13 @@ func (w *Worker) processAccount(ctx context.Context, accountID int64) {
 		return
 	}
 
+	// Linked API only reports accepted requests and replies from the moment its network and
+	// inbox sync are switched on. Sending before that would leave us blind to the answers,
+	// so nothing is sent until both are on.
+	if w.syncPending(ctx, accountID, now) {
+		return
+	}
+
 	dayStart, dayEnd := sched.DayBounds(now)
 	used, err := w.usedToday(ctx, accountID, dayStart, dayEnd)
 	if err != nil {
@@ -293,6 +314,64 @@ func (w *Worker) processAccount(ctx context.Context, accountID int64) {
 	}
 }
 
+// syncPending starts whichever sync task is still missing and reports whether any is. It
+// returns true while sync is incomplete, even when it is waiting to retry after a failure.
+func (w *Worker) syncPending(ctx context.Context, accountID int64, now time.Time) bool {
+	var network, inbox *time.Time
+	if err := w.pool.QueryRow(ctx,
+		`SELECT network_synced_at, inbox_synced_at FROM linkedin_accounts WHERE id = $1`, accountID).Scan(&network, &inbox); err != nil {
+		w.log.Error("read sync state", "account", accountID, "err", err)
+		return true // when in doubt, do not send
+	}
+	pending := false
+	for _, task := range []struct {
+		kind string
+		done *time.Time
+	}{{kindSyncNetwork, network}, {kindSyncInbox, inbox}} {
+		if task.done != nil {
+			continue
+		}
+		pending = true
+		var last *time.Time
+		if err := w.pool.QueryRow(ctx, `SELECT max(created_at) FROM send_attempts WHERE account_id = $1 AND kind = $2`,
+			accountID, task.kind).Scan(&last); err != nil {
+			w.log.Error("read sync history", "account", accountID, "err", err)
+			return true
+		}
+		if last != nil && now.Sub(*last) < syncRetry {
+			continue // tried recently and it did not work: wait before trying again
+		}
+		t, res, err := w.claimSync(ctx, accountID, task.kind, now)
+		if err != nil {
+			w.log.Error("claim sync", "account", accountID, "kind", task.kind, "err", err)
+			return true
+		}
+		if res == claimed {
+			w.send(ctx, t, now)
+		}
+		return true // one task at a time: a sync task in flight or just started
+	}
+	return pending
+}
+
+// claimSync records a sync task for the account. It uses the same one-open-task-per-account
+// index as sends, so a sync never runs alongside a send.
+func (w *Worker) claimSync(ctx context.Context, accountID int64, kind string, now time.Time) (*toSend, claimResult, error) {
+	t := toSend{attempt: attempt{accountID: accountID, kind: kind, status: statusStarting, createdAt: now}}
+	err := w.pool.QueryRow(ctx,
+		`INSERT INTO send_attempts (user_id, account_id, campaign_id, lead_id, kind, status, created_at, updated_at)
+		 SELECT user_id, id, 0, 0, $2, 'starting', $3, $3 FROM linkedin_accounts WHERE id = $1
+		 RETURNING id, user_id`, accountID, kind, now).Scan(&t.id, &t.userID)
+	if err != nil {
+		var pg *pgconn.PgError
+		if errors.As(err, &pg) && pg.Code == "23505" {
+			return nil, claimBusy, nil
+		}
+		return nil, claimNone, err
+	}
+	return &t, claimed, nil
+}
+
 func (w *Worker) hasOpenAttempt(ctx context.Context, accountID int64) (bool, error) {
 	var open bool
 	err := w.pool.QueryRow(ctx,
@@ -307,6 +386,7 @@ func (w *Worker) usedToday(ctx context.Context, accountID int64, from, to time.T
 	rows, err := w.pool.Query(ctx,
 		`SELECT kind, count(*) FROM send_attempts
 		  WHERE account_id = $1 AND created_at >= $2 AND created_at < $3
+		    AND kind IN ('connect','message','followup')
 		    AND status IN ('starting','submitted','succeeded','unknown')
 		  GROUP BY kind`, accountID, from, to)
 	if err != nil {
@@ -424,12 +504,17 @@ func (w *Worker) send(ctx context.Context, t *toSend, now time.Time) {
 		return
 	}
 	var action map[string]any
-	if t.kind == kindConnect {
+	switch t.kind {
+	case kindConnect:
 		action = map[string]any{"actionType": "st.sendConnectionRequest", "personUrl": t.profileURL}
 		if t.text != "" {
 			action["note"] = t.text
 		}
-	} else {
+	case kindSyncNetwork:
+		action = map[string]any{"actionType": "st.syncNetwork"}
+	case kindSyncInbox:
+		action = map[string]any{"actionType": "st.syncInbox"}
+	default:
 		action = map[string]any{"actionType": "st.sendMessage", "personUrl": t.profileURL, "text": t.text}
 	}
 
