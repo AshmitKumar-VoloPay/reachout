@@ -105,6 +105,37 @@ func accessLog(log *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
+// csrf blocks cross-site browser requests that change state. Cookies are SameSite=Lax
+// already; this adds an Origin / Fetch-Metadata check so a request from another site is
+// rejected even if a browser ignores SameSite. Requests with neither header (curl,
+// server-to-server webhooks) pass: they carry no ambient browser cookie to abuse.
+func csrf(allowed []string) func(http.Handler) http.Handler {
+	set := make(map[string]bool, len(allowed))
+	for _, o := range allowed {
+		set[o] = true
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet, http.MethodHead, http.MethodOptions:
+				next.ServeHTTP(w, r)
+				return
+			}
+			origin := r.Header.Get("Origin")
+			if origin != "" {
+				if !set[origin] {
+					WriteError(w, http.StatusForbidden, "csrf", "cross-site request blocked")
+					return
+				}
+			} else if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				WriteError(w, http.StatusForbidden, "csrf", "cross-site request blocked")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // timeout cancels the request context and answers 503 once d has passed.
 func timeout(d time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

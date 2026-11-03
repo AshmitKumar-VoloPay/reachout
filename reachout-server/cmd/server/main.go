@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,9 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ashmit/reachout-server/internal/accounts"
+	"github.com/ashmit/reachout-server/internal/auth"
 	"github.com/ashmit/reachout-server/internal/config"
 	"github.com/ashmit/reachout-server/internal/db"
 	"github.com/ashmit/reachout-server/internal/httpapi"
+	"github.com/ashmit/reachout-server/internal/linkedin"
 	"github.com/ashmit/reachout-server/migrations"
 )
 
@@ -27,6 +31,12 @@ func run() error {
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		return err
+	}
+	if cfg.LinkedAPIToken == "" {
+		return errors.New("LINKED_API_TOKEN is required")
+	}
+	if cfg.TokenKey == nil {
+		return errors.New("TOKEN_ENCRYPTION_KEY is required (openssl rand -base64 32)")
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(log)
@@ -46,7 +56,16 @@ func run() error {
 	}
 	log.Info("migrations", "applied", applied)
 
-	_, handler := httpapi.NewRouter(httpapi.Deps{DB: pool, Log: log})
+	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: pool, Log: log, AllowedOrigins: cfg.AppOrigins})
+	authH := auth.NewHandler(auth.NewService(pool), auth.Options{CookieSecure: cfg.CookieSecure, Log: log})
+	authH.Register(mux)
+
+	cipher, err := accounts.NewCipher(cfg.TokenKey)
+	if err != nil {
+		return fmt.Errorf("TOKEN_ENCRYPTION_KEY: %w", err)
+	}
+	li := linkedin.NewHTTPClient(cfg.LinkedAPIBaseURL, cfg.LinkedAPIToken)
+	accounts.NewHandler(accounts.NewService(pool, li, cipher, log), authH, log).Register(mux)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,

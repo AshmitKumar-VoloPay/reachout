@@ -16,8 +16,9 @@ type Pinger interface {
 }
 
 type Deps struct {
-	DB  Pinger
-	Log *slog.Logger
+	DB             Pinger
+	Log            *slog.Logger
+	AllowedOrigins []string // browser origins allowed to make state-changing requests
 }
 
 const requestTimeout = 30 * time.Second
@@ -39,9 +40,10 @@ func NewRouter(d Deps) (*http.ServeMux, http.Handler) {
 		WriteError(w, http.StatusNotFound, "not_found", "no such route")
 	})
 
-	// Outermost first: ID, access log, panic recovery, timeout.
+	// Outermost first: ID, access log, panic recovery, CSRF, timeout.
 	var h http.Handler = mux
 	h = timeout(requestTimeout)(h)
+	h = csrf(d.AllowedOrigins)(h)
 	h = recoverer(d.Log)(h)
 	h = accessLog(d.Log)(h)
 	h = withRequestID(h)
