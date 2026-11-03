@@ -17,6 +17,8 @@ type Fake struct {
 	Err      map[string]error  // method name -> error returned once
 	Calls    []string          // method names, in call order
 	Workflow func(token string, action map[string]any) (WorkflowStart, error)
+	// GetWorkflowFn overrides GetWorkflow's default "completed, success" answer.
+	GetWorkflowFn func(token, workflowID string) (WorkflowResult, error)
 }
 
 var _ Client = (*Fake)(nil)
@@ -108,6 +110,9 @@ func (f *Fake) GetWorkflow(ctx context.Context, token, workflowID string) (Workf
 	defer f.mu.Unlock()
 	if err := f.enter("GetWorkflow"); err != nil {
 		return WorkflowResult{}, err
+	}
+	if f.GetWorkflowFn != nil {
+		return f.GetWorkflowFn(token, workflowID)
 	}
 	return WorkflowResult{Status: "completed", Completion: []byte(`{"success":true}`)}, nil
 }

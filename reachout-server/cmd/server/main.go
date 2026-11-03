@@ -16,6 +16,7 @@ import (
 	"github.com/ashmit/reachout-server/internal/config"
 	"github.com/ashmit/reachout-server/internal/db"
 	"github.com/ashmit/reachout-server/internal/httpapi"
+	"github.com/ashmit/reachout-server/internal/leads"
 	"github.com/ashmit/reachout-server/internal/linkedin"
 	"github.com/ashmit/reachout-server/migrations"
 )
@@ -65,7 +66,9 @@ func run() error {
 		return fmt.Errorf("TOKEN_ENCRYPTION_KEY: %w", err)
 	}
 	li := linkedin.NewHTTPClient(cfg.LinkedAPIBaseURL, cfg.LinkedAPIToken)
-	accounts.NewHandler(accounts.NewService(pool, li, cipher, log), authH, log).Register(mux)
+	accountsSvc := accounts.NewService(pool, li, cipher, log)
+	accounts.NewHandler(accountsSvc, authH, log).Register(mux)
+	leads.NewHandler(leads.NewService(pool, li, accountsSvc, log), authH, log).Register(mux)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
