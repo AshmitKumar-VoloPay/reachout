@@ -26,6 +26,7 @@ const (
 
 var (
 	ErrNotFound          = errors.New("lead not found")
+	ErrInActiveCampaign  = errors.New("lead is in a running or paused campaign; remove it from the campaign or stop the campaign first")
 	ErrInvalidInput      = errors.New("invalid input")
 	ErrAccountNotReady   = errors.New("LinkedIn account is not connected")
 	ErrImportInProgress  = errors.New("a search import is already running for this account")
@@ -236,29 +237,44 @@ func (s *Service) Get(ctx context.Context, userID, id int64) (Lead, error) {
 	return l, err
 }
 
-// Delete removes one lead. Campaign entries for it go with it (ON DELETE CASCADE).
+// inActiveCampaign is true for a leads row l that sits in a running or paused campaign.
+// Deleting such a lead would silently pull a prospect out of a live sequence, so it is
+// refused: remove the lead from the campaign or stop the campaign first.
+const inActiveCampaign = `EXISTS (SELECT 1 FROM campaign_leads cl JOIN campaigns c ON c.id = cl.campaign_id
+	WHERE cl.lead_id = l.id AND c.status IN ('running','paused'))`
+
+// Delete removes one lead. Campaign entries in drafts, stopped and finished campaigns go
+// with it (ON DELETE CASCADE); a lead in a running or paused campaign is refused.
 func (s *Service) Delete(ctx context.Context, userID, id int64) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM leads WHERE id = $1 AND user_id = $2`, id, userID)
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM leads l WHERE l.id = $1 AND l.user_id = $2 AND NOT `+inActiveCampaign, id, userID)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+	if tag.RowsAffected() == 1 {
+		return nil
 	}
-	return nil
+	if _, err := s.Get(ctx, userID, id); err != nil {
+		return err // not found
+	}
+	return ErrInActiveCampaign
 }
 
-// DeleteMany removes the listed leads that belong to userID and returns how many were
-// deleted. Ids that are unknown or owned by someone else are ignored.
-func (s *Service) DeleteMany(ctx context.Context, userID int64, ids []int64) (int64, error) {
+// DeleteMany removes the listed leads that belong to userID. It returns how many were
+// deleted and how many were skipped because they are in a running or paused campaign.
+// Ids that are unknown or owned by someone else are ignored.
+func (s *Service) DeleteMany(ctx context.Context, userID int64, ids []int64) (deleted, blocked int64, err error) {
 	if len(ids) == 0 || len(ids) > MaxBulkDelete {
-		return 0, fmt.Errorf("%w: send between 1 and %d ids", ErrInvalidInput, MaxBulkDelete)
+		return 0, 0, fmt.Errorf("%w: send between 1 and %d ids", ErrInvalidInput, MaxBulkDelete)
 	}
-	tag, err := s.pool.Exec(ctx, `DELETE FROM leads WHERE user_id = $1 AND id = ANY($2)`, userID, ids)
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM leads l WHERE l.user_id = $1 AND l.id = ANY($2) AND NOT `+inActiveCampaign, userID, ids)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return tag.RowsAffected(), nil
+	err = s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM leads l WHERE l.user_id = $1 AND l.id = ANY($2) AND `+inActiveCampaign, userID, ids).Scan(&blocked)
+	return tag.RowsAffected(), blocked, err
 }
 
 func truncate(s string, n int) string {

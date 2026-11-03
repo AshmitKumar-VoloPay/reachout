@@ -97,12 +97,12 @@ func (h *Handler) bulkDelete(w http.ResponseWriter, r *http.Request) {
 	if !httpapi.DecodeJSON(w, r, &in) {
 		return
 	}
-	n, err := h.svc.DeleteMany(r.Context(), userID(r), in.IDs)
+	deleted, blocked, err := h.svc.DeleteMany(r.Context(), userID(r), in.IDs)
 	if err != nil {
 		h.fail(w, r, err)
 		return
 	}
-	httpapi.WriteJSON(w, http.StatusOK, map[string]int64{"deleted": n})
+	httpapi.WriteJSON(w, http.StatusOK, map[string]int64{"deleted": deleted, "blocked": blocked})
 }
 
 func (h *Handler) importURLs(w http.ResponseWriter, r *http.Request) {
@@ -157,6 +157,8 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, ErrNotFound), errors.Is(err, accounts.ErrNotFound):
 		httpapi.WriteError(w, http.StatusNotFound, "not_found", "not found")
+	case errors.Is(err, ErrInActiveCampaign):
+		httpapi.WriteError(w, http.StatusConflict, "lead_in_active_campaign", err.Error())
 	case errors.Is(err, ErrInvalidInput):
 		httpapi.WriteError(w, http.StatusBadRequest, "invalid_input", err.Error())
 	case errors.Is(err, ErrAccountNotReady):

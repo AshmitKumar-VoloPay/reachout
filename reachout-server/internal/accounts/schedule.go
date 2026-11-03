@@ -42,6 +42,24 @@ func (s *Service) GetSchedule(ctx context.Context, userID, accountID int64) (Sch
 	if _, err := s.get(ctx, userID, accountID); err != nil {
 		return ScheduleView{}, err
 	}
+	st, err := s.loadSettings(ctx, accountID)
+	if err != nil {
+		return ScheduleView{}, err
+	}
+	return s.view(st)
+}
+
+// LoadSchedule returns the account's sending schedule for the worker and campaign code. It
+// is not scoped by user: the caller must already have established who owns the account.
+func (s *Service) LoadSchedule(ctx context.Context, accountID int64) (schedule.Schedule, error) {
+	st, err := s.loadSettings(ctx, accountID)
+	if err != nil {
+		return schedule.Schedule{}, err
+	}
+	return buildSchedule(st)
+}
+
+func (s *Service) loadSettings(ctx context.Context, accountID int64) (ScheduleSettings, error) {
 	var st ScheduleSettings
 	var days []int16
 	var start, end int
@@ -51,10 +69,10 @@ func (s *Service) GetSchedule(ctx context.Context, userID, accountID int64) (Sch
 		   FROM account_schedules WHERE account_id = $1`, accountID).
 		Scan(&st.Timezone, &days, &start, &end, &hols, &st.DailyConnectCap, &st.DailyMessageCap)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ScheduleView{}, ErrNotFound
+		return ScheduleSettings{}, ErrNotFound
 	}
 	if err != nil {
-		return ScheduleView{}, err
+		return ScheduleSettings{}, err
 	}
 	st.WorkDays = make([]int, len(days))
 	for i, d := range days {
@@ -65,7 +83,7 @@ func (s *Service) GetSchedule(ctx context.Context, userID, accountID int64) (Sch
 	for i, h := range hols {
 		st.Holidays[i] = h.Format("2006-01-02")
 	}
-	return s.view(st)
+	return st, nil
 }
 
 func (s *Service) view(st ScheduleSettings) (ScheduleView, error) {

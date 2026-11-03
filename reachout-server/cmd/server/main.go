@@ -13,6 +13,7 @@ import (
 
 	"github.com/ashmit/reachout-server/internal/accounts"
 	"github.com/ashmit/reachout-server/internal/auth"
+	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/config"
 	"github.com/ashmit/reachout-server/internal/db"
 	"github.com/ashmit/reachout-server/internal/httpapi"
@@ -69,6 +70,7 @@ func run() error {
 	accountsSvc := accounts.NewService(pool, li, cipher, log)
 	accounts.NewHandler(accountsSvc, authH, log).Register(mux)
 	leads.NewHandler(leads.NewService(pool, li, accountsSvc, log), authH, log).Register(mux)
+	campaigns.NewHandler(campaigns.NewService(pool, accountsSvc, log), authH, log).Register(mux)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
