@@ -16,13 +16,15 @@ import (
 	"github.com/ashmit/reachout-server/internal/auth"
 	"github.com/ashmit/reachout-server/internal/httpapi"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/testdb"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 type env struct {
 	t    *testing.T
-	pool *pgxpool.Pool
+	db   *mongo.Database
 	svc  *Service
 	fake *linkedin.Fake
 	h    http.Handler
@@ -31,7 +33,7 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	pool := testdb.New(t)
+	db := testdb.New(t)
 	key := make([]byte, 32)
 	rand.Read(key)
 	c, err := NewCipher(key)
@@ -40,14 +42,14 @@ func newEnv(t *testing.T) *env {
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fake := linkedin.NewFake()
-	svc := NewService(pool, fake, c, log)
+	svc := NewService(db, fake, c, log)
 
-	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: pool, Log: log, AllowedOrigins: []string{"http://localhost:5173"}})
-	aSvc := auth.NewService(pool)
+	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: mdb.Pinger{DB: db}, Log: log, AllowedOrigins: []string{"http://localhost:5173"}})
+	aSvc := auth.NewService(db)
 	ah := auth.NewHandler(aSvc, auth.Options{Log: log})
 	ah.Register(mux)
 	NewHandler(svc, ah, log).Register(mux)
-	return &env{t: t, pool: pool, svc: svc, fake: fake, h: handler, aSvc: aSvc}
+	return &env{t: t, db: db, svc: svc, fake: fake, h: handler, aSvc: aSvc}
 }
 
 // user signs up and returns the session cookie value.
@@ -82,6 +84,17 @@ func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 		t.Fatalf("decode %q: %v", rec.Body, err)
 	}
 	return v
+}
+
+// storedToken is the encrypted identification token as stored, or "" if there is none.
+func (e *env) storedToken(accountID int64) string {
+	d := testdb.One[struct {
+		Token *string `bson:"identification_token"`
+	}](e.t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: accountID}})
+	if d.Token == nil {
+		return ""
+	}
+	return *d.Token
 }
 
 func laAccount(id, token string) linkedin.Account {
@@ -161,8 +174,7 @@ func TestTokenEncryptedAtRestAndNeverReturned(t *testing.T) {
 	u := e.user("a@example.com")
 	acc := e.connect(u, "la-1", "IDENT-TOKEN-SECRET")
 
-	var stored string
-	e.pool.QueryRow(context.Background(), `SELECT identification_token FROM linkedin_accounts WHERE id = $1`, acc.ID).Scan(&stored)
+	stored := e.storedToken(acc.ID)
 	if strings.Contains(stored, "IDENT-TOKEN-SECRET") || !strings.HasPrefix(stored, "v1:") {
 		t.Fatalf("token stored in the clear or unversioned: %q", stored)
 	}
@@ -186,12 +198,7 @@ func TestTokenBoundToItsRow(t *testing.T) {
 	b := e.connect(e.user("b@example.com"), "la-2", "TOKEN-B")
 
 	// Copy A's ciphertext into B's row: it must not decrypt as B.
-	_, err := e.pool.Exec(context.Background(),
-		`UPDATE linkedin_accounts SET identification_token = (SELECT identification_token FROM linkedin_accounts WHERE id = $1) WHERE id = $2`,
-		a.ID, b.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	testdb.Update(t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: b.ID}}, bson.D{{Key: "identification_token", Value: e.storedToken(a.ID)}})
 	if tok, err := e.svc.IdentificationToken(context.Background(), b.ID); err == nil {
 		t.Fatalf("swapped ciphertext decrypted as %q", tok)
 	}
@@ -252,9 +259,10 @@ func TestOnlyOneConnectionAtATime(t *testing.T) {
 		t.Fatalf("second connect: %d %s", rec.Code, rec.Body)
 	}
 	// The refused attempt left no row and no Linked API session behind.
-	var n int
-	e.pool.QueryRow(context.Background(), `SELECT count(*) FROM linkedin_accounts WHERE user_id = (SELECT id FROM users WHERE email = 'bob@example.com')`).Scan(&n)
-	if n != 0 {
+	bobDoc := testdb.One[struct {
+		ID int64 `bson:"_id"`
+	}](t, e.db, mdb.Users, bson.D{{Key: "email", Value: "bob@example.com"}})
+	if n := testdb.Count(t, e.db, mdb.Accounts, bson.D{{Key: "user_id", Value: bobDoc.ID}}); n != 0 {
 		t.Fatalf("bob has %d rows", n)
 	}
 
@@ -273,7 +281,7 @@ func TestStalePendingDoesNotBlockForever(t *testing.T) {
 	if rec := e.do(alice, "POST", "/api/accounts/connect", nil); rec.Code != 201 {
 		t.Fatal(rec.Body)
 	}
-	e.pool.Exec(context.Background(), `UPDATE linkedin_accounts SET created_at = now() - interval '11 minutes'`)
+	testdb.Update(t, e.db, mdb.Accounts, bson.D{}, bson.D{{Key: "created_at", Value: time.Now().Add(-11 * time.Minute)}})
 
 	if rec := e.do(bob, "POST", "/api/accounts/connect", nil); rec.Code != 201 {
 		t.Fatalf("bob blocked by stale attempt: %d %s", rec.Code, rec.Body)
@@ -304,9 +312,7 @@ func TestAmbiguousNewAccountIsNotAssigned(t *testing.T) {
 	if got.Status != StatusError {
 		t.Fatalf("status %q", got.Status)
 	}
-	var tok *string
-	e.pool.QueryRow(context.Background(), `SELECT identification_token FROM linkedin_accounts WHERE id = $1`, acc.ID).Scan(&tok)
-	if tok != nil {
+	if tok := e.storedToken(acc.ID); tok != "" {
 		t.Fatal("an account was attached despite ambiguity")
 	}
 }
@@ -318,7 +324,7 @@ func TestAlreadyClaimedAccountsAreIgnored(t *testing.T) {
 
 	// Bob connects. Even if la-1 were missing from `known` (e.g. a stale snapshot), it is claimed.
 	acc := decode[accountResponse](t, e.do(bob, "POST", "/api/accounts/connect", nil)).Account
-	e.pool.Exec(context.Background(), `UPDATE linkedin_accounts SET known_account_ids = '{}' WHERE id = $1`, acc.ID)
+	testdb.Update(t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: acc.ID}}, bson.D{{Key: "known_account_ids", Value: bson.A{}}})
 	e.fake.FinishSession("sess-2", laAccount("la-2", "TB"))
 	got := decode[accountResponse](t, e.do(bob, "POST", "/api/accounts/"+itoa(acc.ID)+"/refresh", nil)).Account
 	if got.Status != StatusConnected || got.Name != "Ada #2" {

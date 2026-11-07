@@ -13,8 +13,10 @@ import (
 
 	"github.com/ashmit/reachout-server/internal/auth"
 	"github.com/ashmit/reachout-server/internal/httpapi"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ashmit/reachout-server/internal/mdb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 var ErrNotFound = errors.New("conversation not found")
@@ -25,9 +27,11 @@ const (
 	snippetLen  = 160
 )
 
-type Service struct{ pool *pgxpool.Pool }
+type Service struct{ db *mongo.Database }
 
-func NewService(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+func NewService(db *mongo.Database) *Service { return &Service{db: db} }
+
+func eq(k string, v any) bson.E { return bson.E{Key: k, Value: v} }
 
 // Conversation is one row of the inbox.
 type Conversation struct {
@@ -50,16 +54,30 @@ type List struct {
 	Offset        int            `json:"offset"`
 }
 
-// base selects one row per lead that has at least one reply.
-const base = `
-	SELECT m.lead_id,
-	       max(m.at) FILTER (WHERE m.direction = 'in') AS last_reply,
-	       max(m.at)                                     AS last_at,
-	       count(*) FILTER (WHERE m.direction = 'in' AND m.read_at IS NULL) AS unread
-	  FROM messages m JOIN leads l ON l.id = m.lead_id
-	 WHERE l.user_id = $1
-	 GROUP BY m.lead_id
-	HAVING bool_or(m.direction = 'in')`
+// conversations groups a user's messages into one row per lead. Messages carry their owner's
+// id, so this never reaches another user's data. The latest message is picked with $top, which
+// needs no sort of the whole collection.
+func conversations(userID int64) mongo.Pipeline {
+	isIn := bson.D{{Key: "$eq", Value: bson.A{"$direction", "in"}}}
+	// Unread: a reply (direction "in") whose read_at is missing or null.
+	notRead := bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$read_at", nil}}}, nil}}}
+	unread := bson.D{{Key: "$and", Value: bson.A{isIn, notRead}}}
+	return mongo.Pipeline{
+		{{Key: "$match", Value: bson.D{eq("user_id", userID)}}},
+		{{Key: "$group", Value: bson.D{
+			eq("_id", "$lead_id"),
+			eq("last_reply", bson.D{{Key: "$max", Value: bson.D{{Key: "$cond", Value: bson.A{isIn, "$at", nil}}}}}),
+			eq("last_at", bson.D{{Key: "$max", Value: "$at"}}),
+			eq("unread", bson.D{{Key: "$sum", Value: bson.D{{Key: "$cond", Value: bson.A{unread, 1, 0}}}}}),
+			eq("latest", bson.D{{Key: "$top", Value: bson.D{
+				eq("sortBy", bson.D{eq("at", -1), eq("_id", -1)}),
+				eq("output", bson.D{eq("body", "$body"), eq("direction", "$direction")}),
+			}}}),
+		}}},
+		// Only people who have replied at least once belong in the inbox.
+		{{Key: "$match", Value: bson.D{eq("last_reply", bson.D{{Key: "$ne", Value: nil}})}}},
+	}
+}
 
 func (s *Service) List(ctx context.Context, userID int64, unreadOnly bool, limit, offset int) (List, error) {
 	if limit <= 0 {
@@ -73,37 +91,89 @@ func (s *Service) List(ctx context.Context, userID int64, unreadOnly bool, limit
 	}
 	out := List{Conversations: []Conversation{}, Limit: limit, Offset: offset}
 
-	if err := s.pool.QueryRow(ctx,
-		`SELECT count(*) FILTER (WHERE ($2 = false OR unread > 0)), coalesce(sum(unread), 0) FROM (`+base+`) c`,
-		userID, unreadOnly).Scan(&out.Total, &out.UnreadTotal); err != nil {
-		return List{}, err
+	shown := bson.A{}
+	if unreadOnly {
+		shown = append(shown, bson.D{{Key: "$match", Value: bson.D{eq("unread", bson.D{{Key: "$gt", Value: 0}})}}})
 	}
-	rows, err := s.pool.Query(ctx,
-		`SELECT l.id, l.name, l.headline, l.profile_url, c.last_reply, c.last_at, c.unread,
-		        lm.body, lm.direction
-		   FROM (`+base+`) c
-		   JOIN leads l ON l.id = c.lead_id
-		   JOIN LATERAL (SELECT body, direction FROM messages WHERE lead_id = l.id ORDER BY at DESC, id DESC LIMIT 1) lm ON true
-		  WHERE ($2 = false OR c.unread > 0)
-		  ORDER BY c.last_reply DESC, l.id DESC LIMIT $3 OFFSET $4`, userID, unreadOnly, limit, offset)
+	rowsStage := append(append(bson.A{}, shown...),
+		bson.D{{Key: "$sort", Value: bson.D{eq("last_reply", -1), eq("_id", -1)}}},
+		bson.D{{Key: "$skip", Value: int64(offset)}}, bson.D{{Key: "$limit", Value: int64(limit)}})
+	totalStage := append(append(bson.A{}, shown...), bson.D{{Key: "$count", Value: "n"}})
+	pipeline := append(conversations(userID), bson.D{{Key: "$facet", Value: bson.D{
+		eq("rows", rowsStage),
+		eq("total", totalStage),
+		eq("unread_total", bson.A{bson.D{{Key: "$group", Value: bson.D{eq("_id", nil), eq("n", bson.D{{Key: "$sum", Value: "$unread"}})}}}}),
+	}}})
+
+	cur, err := s.db.Collection(mdb.Messages).Aggregate(ctx, pipeline)
 	if err != nil {
 		return List{}, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var c Conversation
-		var body, dir string
-		if err := rows.Scan(&c.LeadID, &c.Name, &c.Headline, &c.ProfileURL, &c.LastReply, &c.LastAt, &c.Unread, &body, &dir); err != nil {
-			return List{}, err
+	var res []struct {
+		Rows []struct {
+			LeadID    int64     `bson:"_id"`
+			LastReply time.Time `bson:"last_reply"`
+			LastAt    time.Time `bson:"last_at"`
+			Unread    int       `bson:"unread"`
+			Latest    struct {
+				Body      string `bson:"body"`
+				Direction string `bson:"direction"`
+			} `bson:"latest"`
+		} `bson:"rows"`
+		Total []struct {
+			N int `bson:"n"`
+		} `bson:"total"`
+		UnreadTotal []struct {
+			N int `bson:"n"`
+		} `bson:"unread_total"`
+	}
+	if err := cur.All(ctx, &res); err != nil {
+		return List{}, err
+	}
+	if len(res) == 0 {
+		return out, nil
+	}
+	if len(res[0].Total) > 0 {
+		out.Total = res[0].Total[0].N
+	}
+	if len(res[0].UnreadTotal) > 0 {
+		out.UnreadTotal = res[0].UnreadTotal[0].N
+	}
+
+	leadIDs := make(bson.A, len(res[0].Rows))
+	for i, r := range res[0].Rows {
+		leadIDs[i] = r.LeadID
+	}
+	lc, err := s.db.Collection(mdb.Leads).Find(ctx, bson.D{eq("_id", bson.D{{Key: "$in", Value: leadIDs}}), eq("user_id", userID)})
+	if err != nil {
+		return List{}, err
+	}
+	var leadDocs []struct {
+		ID         int64  `bson:"_id"`
+		Name       string `bson:"name"`
+		Headline   string `bson:"headline"`
+		ProfileURL string `bson:"profile_url"`
+	}
+	if err := lc.All(ctx, &leadDocs); err != nil {
+		return List{}, err
+	}
+	byID := map[int64]int{}
+	for i, l := range leadDocs {
+		byID[l.ID] = i
+	}
+	for _, r := range res[0].Rows {
+		i, ok := byID[r.LeadID]
+		if !ok {
+			continue // the lead is gone; its messages go with it
 		}
-		c.Snippet = snippet(body)
-		c.LastFrom = "them"
-		if dir == "out" {
+		c := Conversation{LeadID: r.LeadID, Name: leadDocs[i].Name, Headline: leadDocs[i].Headline, ProfileURL: leadDocs[i].ProfileURL,
+			Snippet: snippet(r.Latest.Body), LastAt: r.LastAt, LastReply: r.LastReply, Unread: r.Unread, LastFrom: "them"}
+		if r.Latest.Direction == "out" {
 			c.LastFrom = "us"
 		}
 		out.Conversations = append(out.Conversations, c)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func snippet(s string) string {
@@ -139,63 +209,96 @@ type Detail struct {
 // Get returns the whole conversation with one lead, oldest message first.
 func (s *Service) Get(ctx context.Context, userID, leadID int64) (Detail, error) {
 	d := Detail{Campaigns: []CampaignRef{}, Messages: []Message{}}
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, name, headline, profile_url FROM leads WHERE id = $1 AND user_id = $2`, leadID, userID).
-		Scan(&d.LeadID, &d.Name, &d.Headline, &d.ProfileURL)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var lead struct {
+		ID         int64  `bson:"_id"`
+		Name       string `bson:"name"`
+		Headline   string `bson:"headline"`
+		ProfileURL string `bson:"profile_url"`
+	}
+	err := s.db.Collection(mdb.Leads).FindOne(ctx, bson.D{eq("_id", leadID), eq("user_id", userID)}).Decode(&lead)
+	if errors.Is(err, mongo.ErrNoDocuments) {
 		return Detail{}, ErrNotFound
 	}
 	if err != nil {
 		return Detail{}, err
 	}
+	d.LeadID, d.Name, d.Headline, d.ProfileURL = lead.ID, lead.Name, lead.Headline, lead.ProfileURL
 
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, direction, body, at, read_at IS NOT NULL OR direction = 'out' FROM messages WHERE lead_id = $1 ORDER BY at, id`, leadID)
+	mc, err := s.db.Collection(mdb.Messages).Find(ctx, bson.D{eq("lead_id", leadID), eq("user_id", userID)},
+		options.Find().SetSort(bson.D{eq("at", 1), eq("_id", 1)}))
 	if err != nil {
 		return Detail{}, err
 	}
-	for rows.Next() {
-		var m Message
-		if err := rows.Scan(&m.ID, &m.Direction, &m.Body, &m.At, &m.Read); err != nil {
-			rows.Close()
-			return Detail{}, err
-		}
-		d.Messages = append(d.Messages, m)
+	var msgs []struct {
+		ID        int64      `bson:"_id"`
+		Direction string     `bson:"direction"`
+		Body      string     `bson:"body"`
+		At        time.Time  `bson:"at"`
+		ReadAt    *time.Time `bson:"read_at"`
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	if err := mc.All(ctx, &msgs); err != nil {
 		return Detail{}, err
 	}
+	for _, m := range msgs {
+		d.Messages = append(d.Messages, Message{ID: m.ID, Direction: m.Direction, Body: m.Body, At: m.At, Read: m.ReadAt != nil || m.Direction == "out"})
+	}
 
-	crow, err := s.pool.Query(ctx,
-		`SELECT c.id, c.name, cl.state FROM campaign_leads cl JOIN campaigns c ON c.id = cl.campaign_id
-		  WHERE cl.lead_id = $1 AND cl.user_id = $2 ORDER BY c.id DESC`, leadID, userID)
+	cc, err := s.db.Collection(mdb.CampaignLeads).Find(ctx, bson.D{eq("lead_id", leadID), eq("user_id", userID)})
 	if err != nil {
 		return Detail{}, err
 	}
-	defer crow.Close()
-	for crow.Next() {
-		var c CampaignRef
-		if err := crow.Scan(&c.ID, &c.Name, &c.State); err != nil {
-			return Detail{}, err
-		}
-		d.Campaigns = append(d.Campaigns, c)
+	var members []struct {
+		CampaignID int64  `bson:"campaign_id"`
+		State      string `bson:"state"`
 	}
-	return d, crow.Err()
+	if err := cc.All(ctx, &members); err != nil {
+		return Detail{}, err
+	}
+	if len(members) == 0 {
+		return d, nil
+	}
+	campaignIDs := make(bson.A, len(members))
+	for i, m := range members {
+		campaignIDs[i] = m.CampaignID
+	}
+	nc, err := s.db.Collection(mdb.Campaigns).Find(ctx, bson.D{eq("_id", bson.D{{Key: "$in", Value: campaignIDs}}), eq("user_id", userID)},
+		options.Find().SetSort(bson.D{eq("_id", -1)}))
+	if err != nil {
+		return Detail{}, err
+	}
+	var names []struct {
+		ID   int64  `bson:"_id"`
+		Name string `bson:"name"`
+	}
+	if err := nc.All(ctx, &names); err != nil {
+		return Detail{}, err
+	}
+	state := map[int64]string{}
+	for _, m := range members {
+		state[m.CampaignID] = m.State
+	}
+	for _, c := range names {
+		d.Campaigns = append(d.Campaigns, CampaignRef{ID: c.ID, Name: c.Name, State: state[c.ID]})
+	}
+	return d, nil
 }
 
 // MarkRead marks every reply from the lead as read and returns how many changed.
 func (s *Service) MarkRead(ctx context.Context, userID, leadID int64) (int64, error) {
-	var owned bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM leads WHERE id = $1 AND user_id = $2)`, leadID, userID).Scan(&owned); err != nil {
+	n, err := s.db.Collection(mdb.Leads).CountDocuments(ctx, bson.D{eq("_id", leadID), eq("user_id", userID)})
+	if err != nil {
 		return 0, err
 	}
-	if !owned {
+	if n == 0 {
 		return 0, ErrNotFound
 	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE messages SET read_at = now() WHERE lead_id = $1 AND direction = 'in' AND read_at IS NULL`, leadID)
-	return tag.RowsAffected(), err
+	r, err := s.db.Collection(mdb.Messages).UpdateMany(ctx,
+		bson.D{eq("lead_id", leadID), eq("user_id", userID), eq("direction", "in"), eq("read_at", nil)},
+		bson.D{{Key: "$set", Value: bson.D{eq("read_at", time.Now())}}})
+	if err != nil {
+		return 0, err
+	}
+	return r.ModifiedCount, nil
 }
 
 // Handler serves the inbox to the browser.

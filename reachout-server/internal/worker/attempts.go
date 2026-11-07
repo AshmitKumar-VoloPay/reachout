@@ -9,6 +9,9 @@ import (
 
 	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/mdb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 type outKind int
@@ -50,24 +53,20 @@ func stepsOf(b []byte) ([3]struct{ Note, Body string }, error) {
 // resolveOpenAttempts settles every send still in flight: it asks Linked API for results of
 // submitted workflows and recovers attempts that were recorded but never submitted.
 func (w *Worker) resolveOpenAttempts(ctx context.Context) {
-	rows, err := w.pool.Query(ctx,
-		`SELECT id, user_id, account_id, campaign_id, lead_id, kind, status, coalesce(workflow_id, ''), created_at
-		   FROM send_attempts WHERE status IN ('starting','submitted') ORDER BY id`)
+	cur, err := w.attempts().Find(ctx, bson.D{eq("open", true)}, options.Find().SetSort(bson.D{eq("_id", 1)}))
 	if err != nil {
 		w.log.Error("list open attempts", "err", err)
 		return
 	}
-	var open []attempt
-	for rows.Next() {
-		var a attempt
-		if err := rows.Scan(&a.id, &a.userID, &a.accountID, &a.campaignID, &a.leadID, &a.kind, &a.status, &a.workflowID, &a.createdAt); err != nil {
-			rows.Close()
-			w.log.Error("scan attempt", "err", err)
-			return
-		}
-		open = append(open, a)
+	var docs []attemptDoc
+	if err := cur.All(ctx, &docs); err != nil {
+		w.log.Error("list open attempts", "err", err)
+		return
 	}
-	rows.Close()
+	open := make([]attempt, len(docs))
+	for i, d := range docs {
+		open[i] = d.attempt()
+	}
 
 	for _, a := range open {
 		switch a.status {
@@ -266,7 +265,7 @@ func (w *Worker) settleSync(ctx context.Context, a attempt, o outcome, now time.
 		if a.kind == kindSyncInbox {
 			col = "inbox_synced_at"
 		}
-		if _, err := w.pool.Exec(ctx, `UPDATE linkedin_accounts SET `+col+` = $1 WHERE id = $2`, now, a.accountID); err != nil {
+		if _, err := w.accountsColl().UpdateOne(ctx, bson.D{eq("_id", a.accountID)}, bson.D{{Key: "$set", Value: bson.D{eq(col, now)}}}); err != nil {
 			w.log.Error("mark synced", "account", a.accountID, "kind", a.kind, "err", err)
 			return
 		}
@@ -312,14 +311,10 @@ func (w *Worker) settleSuccess(ctx context.Context, a attempt, o outcome, now ti
 		if a.kind == kindFollowUp {
 			idx = 2
 		}
-		if _, err := w.pool.Exec(ctx,
-			`INSERT INTO messages (lead_id, direction, body, at)
-			 SELECT $1, 'out', steps->($2::int)->>'body', $3 FROM campaigns WHERE id = $4`,
-			a.leadID, idx, now, a.campaignID); err != nil {
-			w.log.Error("store sent message", "attempt", a.id, "err", err)
-		}
+		w.storeSentMessage(ctx, a, idx, now)
 	}
-	w.pool.Exec(ctx, `UPDATE campaign_leads SET retry_count = 0 WHERE campaign_id = $1 AND lead_id = $2`, a.campaignID, a.leadID)
+	w.db.Collection(mdb.CampaignLeads).UpdateOne(ctx, bson.D{eq("campaign_id", a.campaignID), eq("lead_id", a.leadID)},
+		bson.D{{Key: "$set", Value: bson.D{eq("retry_count", 0)}}})
 
 	// Random gap before the account's next send.
 	if sched, err := w.acc.LoadSchedule(ctx, a.accountID); err == nil {
@@ -343,11 +338,14 @@ func (w *Worker) settleLimit(ctx context.Context, a attempt, o outcome, now time
 	nextDay := sched.NextSlot(dayEnd)
 
 	if o.countRetry {
-		var retries int
-		err := w.pool.QueryRow(ctx,
-			`UPDATE campaign_leads SET retry_count = retry_count + 1
-			  WHERE campaign_id = $1 AND lead_id = $2 RETURNING retry_count`, a.campaignID, a.leadID).Scan(&retries)
-		if err == nil && retries >= w.cfg.MaxLimitRetries {
+		var after struct {
+			RetryCount int `bson:"retry_count"`
+		}
+		err := w.db.Collection(mdb.CampaignLeads).FindOneAndUpdate(ctx,
+			bson.D{eq("campaign_id", a.campaignID), eq("lead_id", a.leadID)},
+			bson.D{{Key: "$inc", Value: bson.D{eq("retry_count", 1)}}},
+			options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&after)
+		if err == nil && after.RetryCount >= w.cfg.MaxLimitRetries {
 			w.failLead(ctx, a, "LinkedIn repeatedly refused this request ("+o.detail+")", now)
 		} else {
 			w.setLeadDue(ctx, a, nextDay)
@@ -363,14 +361,16 @@ func (w *Worker) settleLimit(ctx context.Context, a attempt, o outcome, now time
 
 // closeAttempt moves an open attempt to a final status. It reports whether this call did it.
 func (w *Worker) closeAttempt(ctx context.Context, a attempt, status, detail string, now time.Time) bool {
-	tag, err := w.pool.Exec(ctx,
-		`UPDATE send_attempts SET status = $1, detail = $2, updated_at = $3, finished_at = $3
-		  WHERE id = $4 AND status IN ('starting','submitted')`, status, detail, now, a.id)
+	// Only an open attempt can be closed, and unsetting `open` frees the account's single slot.
+	r, err := w.attempts().UpdateOne(ctx, bson.D{eq("_id", a.id), eq("open", true)}, bson.D{
+		{Key: "$set", Value: bson.D{eq("status", status), eq("detail", detail), eq("updated_at", now), eq("finished_at", now)}},
+		{Key: "$unset", Value: bson.D{eq("open", "")}},
+	})
 	if err != nil {
 		w.log.Error("close attempt", "attempt", a.id, "err", err)
 		return false
 	}
-	return tag.RowsAffected() == 1
+	return r.ModifiedCount == 1
 }
 
 func (w *Worker) failLead(ctx context.Context, a attempt, detail string, now time.Time) {
@@ -381,10 +381,30 @@ func (w *Worker) failLead(ctx context.Context, a attempt, detail string, now tim
 
 // setLeadDue changes when the lead is next tried, without touching its state.
 func (w *Worker) setLeadDue(ctx context.Context, a attempt, at time.Time) {
-	if _, err := w.pool.Exec(ctx,
-		`UPDATE campaign_leads SET next_action_at = $1, updated_at = now()
-		  WHERE campaign_id = $2 AND lead_id = $3 AND state = $4`,
-		at, a.campaignID, a.leadID, stateFor(a.kind)); err != nil {
+	if _, err := w.db.Collection(mdb.CampaignLeads).UpdateOne(ctx,
+		bson.D{eq("campaign_id", a.campaignID), eq("lead_id", a.leadID), eq("state", stateFor(a.kind))},
+		bson.D{{Key: "$set", Value: bson.D{eq("next_action_at", at), eq("updated_at", w.now())}}}); err != nil {
 		w.log.Error("reschedule lead", "attempt", a.id, "err", err)
+	}
+}
+
+// storeSentMessage keeps the text that was sent in the lead's conversation. The body comes from
+// the campaign's step, as it was when it ran. Called once per attempt, by whoever closed it.
+func (w *Worker) storeSentMessage(ctx context.Context, a attempt, step int, now time.Time) {
+	var camp struct {
+		Steps []campaigns.Step `bson:"steps"`
+	}
+	if err := w.campaignsColl().FindOne(ctx, bson.D{eq("_id", a.campaignID)}).Decode(&camp); err != nil || len(camp.Steps) <= step {
+		w.log.Error("store sent message", "attempt", a.id, "err", err)
+		return
+	}
+	id, err := mdb.NextID(ctx, w.db, mdb.Messages)
+	if err != nil {
+		w.log.Error("store sent message", "attempt", a.id, "err", err)
+		return
+	}
+	if _, err := w.db.Collection(mdb.Messages).InsertOne(ctx, bson.D{eq("_id", id), eq("user_id", a.userID), eq("lead_id", a.leadID),
+		eq("direction", "out"), eq("body", camp.Steps[step].Body), eq("at", now)}); err != nil {
+		w.log.Error("store sent message", "attempt", a.id, "err", err)
 	}
 }

@@ -11,9 +11,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ashmit/reachout-server/internal/mdb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 const SessionTTL = 14 * 24 * time.Hour
@@ -34,12 +34,29 @@ type User struct {
 
 // Service is the database side of auth. It knows nothing about HTTP.
 type Service struct {
-	pool *pgxpool.Pool
-	now  func() time.Time
+	db  *mongo.Database
+	now func() time.Time
 }
 
-func NewService(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool, now: time.Now}
+func NewService(db *mongo.Database) *Service {
+	return &Service{db: db, now: time.Now}
+}
+
+type userDoc struct {
+	ID           int64     `bson:"_id"`
+	Email        string    `bson:"email"`
+	PasswordHash string    `bson:"password_hash"`
+	CreatedAt    time.Time `bson:"created_at"`
+}
+
+func (d userDoc) user() User { return User{ID: d.ID, Email: d.Email, CreatedAt: d.CreatedAt} }
+
+// sessionDoc's id is the SHA-256 of the session token.
+type sessionDoc struct {
+	ID        []byte    `bson:"_id"`
+	UserID    int64     `bson:"user_id"`
+	ExpiresAt time.Time `bson:"expires_at"`
+	CreatedAt time.Time `bson:"created_at"`
 }
 
 // NormalizeEmail lowercases and validates a bare address (no display name).
@@ -83,10 +100,9 @@ func (s *Service) startSession(ctx context.Context, userID int64) (string, time.
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	expires := s.now().Add(SessionTTL)
-	if _, err := s.pool.Exec(ctx,
-		`INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, $3)`,
-		hash, userID, expires); err != nil {
+	now := s.now()
+	expires := now.Add(SessionTTL)
+	if _, err := s.db.Collection(mdb.Sessions).InsertOne(ctx, sessionDoc{ID: hash, UserID: userID, ExpiresAt: expires, CreatedAt: now}); err != nil {
 		return "", time.Time{}, err
 	}
 	return token, expires, nil
@@ -105,63 +121,67 @@ func (s *Service) Signup(ctx context.Context, email, password string) (User, str
 	if err != nil {
 		return User{}, "", time.Time{}, err
 	}
-	var u User
-	err = s.pool.QueryRow(ctx,
-		`INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at`,
-		email, hash).Scan(&u.ID, &u.Email, &u.CreatedAt)
+	id, err := mdb.NextID(ctx, s.db, mdb.Users)
 	if err != nil {
-		var pg *pgconn.PgError
-		if errors.As(err, &pg) && pg.Code == "23505" {
+		return User{}, "", time.Time{}, err
+	}
+	doc := userDoc{ID: id, Email: email, PasswordHash: hash, CreatedAt: s.now()}
+	if _, err := s.db.Collection(mdb.Users).InsertOne(ctx, doc); err != nil {
+		if mdb.IsDup(err) { // the unique index on email decides, so two sign-ups cannot both win
 			return User{}, "", time.Time{}, ErrEmailTaken
 		}
 		return User{}, "", time.Time{}, err
 	}
-	token, expires, err := s.startSession(ctx, u.ID)
-	return u, token, expires, err
+	token, expires, err := s.startSession(ctx, id)
+	return doc.user(), token, expires, err
 }
 
 // Login checks credentials and starts a session. Unknown email and wrong password
 // return the same error and take about the same time.
 func (s *Service) Login(ctx context.Context, email, password string) (User, string, time.Time, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
-	var u User
-	var hash string
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, email, created_at, password_hash FROM users WHERE email = $1`, email).
-		Scan(&u.ID, &u.Email, &u.CreatedAt, &hash)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var d userDoc
+	err := s.db.Collection(mdb.Users).FindOne(ctx, bson.D{{Key: "email", Value: email}}).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
 		burnPassword(password)
 		return User{}, "", time.Time{}, ErrInvalidCredentials
 	}
 	if err != nil {
 		return User{}, "", time.Time{}, err
 	}
-	ok, verr := VerifyPassword(password, hash)
+	ok, verr := VerifyPassword(password, d.PasswordHash)
 	if verr != nil || !ok {
 		return User{}, "", time.Time{}, ErrInvalidCredentials
 	}
 	// Drop this user's expired sessions while we are here.
-	s.pool.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1 AND expires_at <= $2`, u.ID, s.now())
-	token, expires, err := s.startSession(ctx, u.ID)
-	return u, token, expires, err
+	s.db.Collection(mdb.Sessions).DeleteMany(ctx, bson.D{{Key: "user_id", Value: d.ID}, {Key: "expires_at", Value: bson.D{{Key: "$lte", Value: s.now()}}}})
+	token, expires, err := s.startSession(ctx, d.ID)
+	return d.user(), token, expires, err
 }
 
 // Logout deletes the session for token. Unknown tokens are not an error.
 func (s *Service) Logout(ctx context.Context, token string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE token_hash = $1`, hashToken(token))
+	_, err := s.db.Collection(mdb.Sessions).DeleteOne(ctx, bson.D{{Key: "_id", Value: hashToken(token)}})
 	return err
 }
 
 // Authenticate resolves a session token to its user.
 func (s *Service) Authenticate(ctx context.Context, token string) (User, error) {
-	var u User
-	err := s.pool.QueryRow(ctx,
-		`SELECT u.id, u.email, u.created_at
-		   FROM sessions se JOIN users u ON u.id = se.user_id
-		  WHERE se.token_hash = $1 AND se.expires_at > $2`,
-		hashToken(token), s.now()).Scan(&u.ID, &u.Email, &u.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
+	// The expiry is checked here as well as by the TTL index, which only sweeps every minute.
+	var sess sessionDoc
+	err := s.db.Collection(mdb.Sessions).FindOne(ctx, bson.D{
+		{Key: "_id", Value: hashToken(token)}, {Key: "expires_at", Value: bson.D{{Key: "$gt", Value: s.now()}}},
+	}).Decode(&sess)
+	if errors.Is(err, mongo.ErrNoDocuments) {
 		return User{}, ErrNoSession
 	}
-	return u, err
+	if err != nil {
+		return User{}, err
+	}
+	var d userDoc
+	err = s.db.Collection(mdb.Users).FindOne(ctx, bson.D{{Key: "_id", Value: sess.UserID}}).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return User{}, ErrNoSession // the user was deleted: the session is worthless
+	}
+	return d.user(), err
 }

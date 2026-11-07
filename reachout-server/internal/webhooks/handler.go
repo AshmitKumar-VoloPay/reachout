@@ -11,8 +11,10 @@ import (
 
 	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/httpapi"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ashmit/reachout-server/internal/mdb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 const (
@@ -29,7 +31,7 @@ type Recorder interface {
 // the only credential, and every event is tied to one of our accounts through its Linked
 // API account id before anything is read or changed.
 type Handler struct {
-	pool   *pgxpool.Pool
+	db     *mongo.Database
 	rec    Recorder
 	secret string
 	log    *slog.Logger
@@ -38,11 +40,11 @@ type Handler struct {
 
 // New returns a handler. With an empty secret every request is refused: an endpoint that
 // cannot verify signatures must not accept events.
-func New(pool *pgxpool.Pool, rec Recorder, secret string, log *slog.Logger) *Handler {
+func New(db *mongo.Database, rec Recorder, secret string, log *slog.Logger) *Handler {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Handler{pool: pool, rec: rec, secret: secret, log: log, now: time.Now}
+	return &Handler{db: db, rec: rec, secret: secret, log: log, now: time.Now}
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -93,18 +95,20 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 // acknowledged and ignored, and if it was not (it failed part way) it is handled again.
 func (h *Handler) process(ctx context.Context, ev envelope) (string, error) {
 	now := h.now()
-	tag, err := h.pool.Exec(ctx,
-		`INSERT INTO webhook_events (event_id, type, received_at) VALUES ($1, $2, $3) ON CONFLICT (event_id) DO NOTHING`,
-		ev.ID, ev.Type, now)
+	events := h.db.Collection(mdb.WebhookEvents)
+	// The event id is the document id, so two deliveries of one event cannot both insert it.
+	_, err := events.InsertOne(ctx, bson.D{eq("_id", ev.ID), eq("type", ev.Type), eq("received_at", now), eq("detail", "")})
 	if err != nil {
-		return "", err
-	}
-	if tag.RowsAffected() == 0 {
-		var processed *time.Time
-		if err := h.pool.QueryRow(ctx, `SELECT processed_at FROM webhook_events WHERE event_id = $1`, ev.ID).Scan(&processed); err != nil {
+		if !mdb.IsDup(err) {
 			return "", err
 		}
-		if processed != nil {
+		var seen struct {
+			ProcessedAt *time.Time `bson:"processed_at"`
+		}
+		if err := events.FindOne(ctx, bson.D{eq("_id", ev.ID)}).Decode(&seen); err != nil {
+			return "", err
+		}
+		if seen.ProcessedAt != nil {
 			return "duplicate", nil
 		}
 	}
@@ -113,8 +117,8 @@ func (h *Handler) process(ctx context.Context, ev envelope) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := h.pool.Exec(ctx,
-		`UPDATE webhook_events SET processed_at = $1, detail = $2 WHERE event_id = $3`, now, detail, ev.ID); err != nil {
+	if _, err := events.UpdateOne(ctx, bson.D{eq("_id", ev.ID)},
+		bson.D{{Key: "$set", Value: bson.D{eq("processed_at", now), eq("detail", detail)}}}); err != nil {
 		return "", err
 	}
 	return "ok", nil
@@ -141,13 +145,26 @@ func (h *Handler) accountFor(ctx context.Context, linkedAPIID string) (account, 
 	if linkedAPIID == "" {
 		return account{}, false, nil
 	}
-	var a account
-	err := h.pool.QueryRow(ctx,
-		`SELECT id, user_id FROM linkedin_accounts WHERE linkedin_account_id = $1`, linkedAPIID).Scan(&a.id, &a.userID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var d struct {
+		ID     int64 `bson:"_id"`
+		UserID int64 `bson:"user_id"`
+	}
+	err := h.db.Collection(mdb.Accounts).FindOne(ctx, bson.D{eq("linkedin_account_id", linkedAPIID)},
+		options.FindOne().SetProjection(bson.D{eq("_id", 1), eq("user_id", 1)})).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
 		return account{}, false, nil
 	}
-	return a, err == nil, err
+	return account{id: d.ID, userID: d.UserID}, err == nil, err
+}
+
+func eq(k string, v any) bson.E { return bson.E{Key: k, Value: v} }
+
+func idsIn(vals []int64) bson.D {
+	a := make(bson.A, len(vals))
+	for i, v := range vals {
+		a[i] = v
+	}
+	return bson.D{{Key: "$in", Value: a}}
 }
 
 // orderingTime reads an event's creation time to decide which of two events is newer. It keeps

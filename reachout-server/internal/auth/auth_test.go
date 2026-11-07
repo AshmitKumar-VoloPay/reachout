@@ -2,7 +2,6 @@ package auth
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -13,8 +12,10 @@ import (
 	"time"
 
 	"github.com/ashmit/reachout-server/internal/httpapi"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/testdb"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 const goodPW = "correct horse battery"
@@ -26,18 +27,18 @@ func TestMain(m *testing.M) {
 }
 
 type env struct {
-	pool *pgxpool.Pool
-	svc  *Service
-	h    http.Handler
+	db  *mongo.Database
+	svc *Service
+	h   http.Handler
 }
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	pool := testdb.New(t)
+	db := testdb.New(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := NewService(pool)
+	svc := NewService(db)
 	mux, handler := httpapi.NewRouter(httpapi.Deps{
-		DB: pool, Log: log, AllowedOrigins: []string{"http://localhost:5173"},
+		DB: mdb.Pinger{DB: db}, Log: log, AllowedOrigins: []string{"http://localhost:5173"},
 	})
 	ah := NewHandler(svc, Options{Log: log})
 	ah.Register(mux)
@@ -45,7 +46,7 @@ func newEnv(t *testing.T) *env {
 		u, _ := UserFrom(r.Context())
 		httpapi.WriteJSON(w, 200, map[string]int64{"user_id": u.ID})
 	}))
-	return &env{pool: pool, svc: svc, h: handler}
+	return &env{db: db, svc: svc, h: handler}
 }
 
 func (e *env) do(method, path string, body any, cookie string, hdr map[string]string) *httptest.ResponseRecorder {
@@ -216,9 +217,7 @@ func TestProtectedRouteNeedsSession(t *testing.T) {
 func TestExpiredSessionRejected(t *testing.T) {
 	e := newEnv(t)
 	tok := e.signup(t, "exp@example.com")
-	if _, err := e.pool.Exec(context.Background(), `UPDATE sessions SET expires_at = now() - interval '1 minute'`); err != nil {
-		t.Fatal(err)
-	}
+	testdb.Update(t, e.db, mdb.Sessions, bson.D{}, bson.D{{Key: "expires_at", Value: time.Now().Add(-time.Minute)}})
 	rec := e.do("GET", "/api/auth/me", nil, tok, nil)
 	if rec.Code != 401 {
 		t.Fatalf("expired session accepted: %d", rec.Code)
@@ -241,16 +240,11 @@ func TestSessionExpiryUsesClock(t *testing.T) {
 func TestTokenStoredHashedOnly(t *testing.T) {
 	e := newEnv(t)
 	tok := e.signup(t, "hash@example.com")
-	var n int
-	// The raw token must not appear as the stored value in any form we can query.
-	e.pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM sessions WHERE token_hash = $1 OR encode(token_hash,'escape') = $2`,
-		[]byte(tok), tok).Scan(&n)
-	if n != 0 {
+	// The raw token must not be a session's id in either form, only its hash.
+	if n := testdb.Count(t, e.db, mdb.Sessions, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: bson.A{[]byte(tok), tok}}}}}); n != 0 {
 		t.Fatal("raw session token found in database")
 	}
-	e.pool.QueryRow(context.Background(), `SELECT count(*) FROM sessions WHERE token_hash = $1`, hashToken(tok)).Scan(&n)
-	if n != 1 {
+	if n := testdb.Count(t, e.db, mdb.Sessions, bson.D{{Key: "_id", Value: hashToken(tok)}}); n != 1 {
 		t.Fatalf("hashed token row count = %d, want 1", n)
 	}
 }
@@ -326,9 +320,7 @@ func TestCSRF(t *testing.T) {
 		}
 	}
 	// A blocked request must not have created the user or a session.
-	var n int
-	e.pool.QueryRow(context.Background(), `SELECT count(*) FROM users`).Scan(&n)
-	if n != 1 {
+	if n := testdb.Count(t, e.db, mdb.Users, bson.D{}); n != 1 {
 		t.Fatalf("users = %d, want 1 (only the allowed request)", n)
 	}
 	// Logout is a POST too: a cross-site page cannot sign the user out.

@@ -14,27 +14,29 @@ import (
 
 	"github.com/ashmit/reachout-server/internal/auth"
 	"github.com/ashmit/reachout-server/internal/httpapi"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/testdb"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 type env struct {
 	t    *testing.T
-	pool *pgxpool.Pool
+	db   *mongo.Database
 	h    http.Handler
 	auth *auth.Service
 }
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	pool := testdb.New(t)
+	db := testdb.New(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: pool, Log: log})
-	aSvc := auth.NewService(pool)
+	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: mdb.Pinger{DB: db}, Log: log})
+	aSvc := auth.NewService(db)
 	ah := auth.NewHandler(aSvc, auth.Options{Log: log})
 	ah.Register(mux)
-	NewHandler(NewService(pool), ah, log).Register(mux)
-	return &env{t: t, pool: pool, h: handler, auth: aSvc}
+	NewHandler(NewService(db), ah, log).Register(mux)
+	return &env{t: t, db: db, h: handler, auth: aSvc}
 }
 
 type user struct {
@@ -72,13 +74,13 @@ func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 
 func (e *env) lead(u user, slug string) int64 {
 	e.t.Helper()
-	var id int64
-	err := e.pool.QueryRow(context.Background(),
-		`INSERT INTO leads (user_id, profile_url, name, headline) VALUES ($1, $2, $3, 'CTO') RETURNING id`,
-		u.id, "https://www.linkedin.com/in/"+slug, strings.ToUpper(slug[:1])+slug[1:]).Scan(&id)
+	id, err := mdb.NextID(context.Background(), e.db, mdb.Leads)
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	testdb.Insert(e.t, e.db, mdb.Leads, bson.D{{Key: "_id", Value: id}, {Key: "user_id", Value: u.id},
+		{Key: "profile_url", Value: "https://www.linkedin.com/in/" + slug}, {Key: "name", Value: strings.ToUpper(slug[:1]) + slug[1:]},
+		{Key: "headline", Value: "CTO"}, {Key: "company", Value: ""}, {Key: "created_at", Value: time.Now()}})
 	return id
 }
 
@@ -87,15 +89,19 @@ var t0 = time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
 // msg adds a message `mins` minutes after t0.
 func (e *env) msg(lead int64, dir, body string, mins int, read bool) {
 	e.t.Helper()
-	var readAt any
-	if read {
-		readAt = t0
-	}
-	if _, err := e.pool.Exec(context.Background(),
-		`INSERT INTO messages (lead_id, direction, body, at, read_at) VALUES ($1, $2, $3, $4, $5)`,
-		lead, dir, body, t0.Add(time.Duration(mins)*time.Minute), readAt); err != nil {
+	owner := testdb.One[struct {
+		UserID int64 `bson:"user_id"`
+	}](e.t, e.db, mdb.Leads, bson.D{{Key: "_id", Value: lead}})
+	id, err := mdb.NextID(context.Background(), e.db, mdb.Messages)
+	if err != nil {
 		e.t.Fatal(err)
 	}
+	doc := bson.D{{Key: "_id", Value: id}, {Key: "user_id", Value: owner.UserID}, {Key: "lead_id", Value: lead},
+		{Key: "direction", Value: dir}, {Key: "body", Value: body}, {Key: "at", Value: t0.Add(time.Duration(mins) * time.Minute)}}
+	if read {
+		doc = append(doc, bson.E{Key: "read_at", Value: t0})
+	}
+	testdb.Insert(e.t, e.db, mdb.Messages, doc)
 }
 
 func TestListShowsConversationsNewestReplyFirst(t *testing.T) {
@@ -182,11 +188,14 @@ func TestConversationAndMarkRead(t *testing.T) {
 	e.msg(ann, "in", "second", 10, false)
 	e.msg(ann, "out", "first", 0, true)
 	e.msg(ann, "in", "third", 20, false)
-	var campaignID int64
-	e.pool.QueryRow(context.Background(), `INSERT INTO linkedin_accounts (user_id, status) VALUES ($1, 'connected') RETURNING id`, u.id).Scan(&campaignID)
-	e.pool.QueryRow(context.Background(),
-		`INSERT INTO campaigns (user_id, account_id, name, steps) VALUES ($1, $2, 'Q4', '[]') RETURNING id`, u.id, campaignID).Scan(&campaignID)
-	e.pool.Exec(context.Background(), `INSERT INTO campaign_leads (campaign_id, lead_id, user_id, state) VALUES ($1, $2, $3, 'replied')`, campaignID, ann, u.id)
+	campaignID, err := mdb.NextID(context.Background(), e.db, mdb.Campaigns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testdb.Insert(t, e.db, mdb.Campaigns, bson.D{{Key: "_id", Value: campaignID}, {Key: "user_id", Value: u.id}, {Key: "account_id", Value: int64(1)},
+		{Key: "name", Value: "Q4"}, {Key: "steps", Value: bson.A{}}, {Key: "status", Value: "running"}, {Key: "created_at", Value: time.Now()}})
+	testdb.Insert(t, e.db, mdb.CampaignLeads, bson.D{{Key: "campaign_id", Value: campaignID}, {Key: "lead_id", Value: ann},
+		{Key: "user_id", Value: u.id}, {Key: "state", Value: "replied"}, {Key: "updated_at", Value: time.Now()}})
 
 	d := decode[map[string]Detail](t, e.get(u, "GET", fmt.Sprintf("/api/inbox/%d", ann)))["conversation"]
 	if d.Name != "Ann" || d.Headline != "CTO" || len(d.Messages) != 3 {

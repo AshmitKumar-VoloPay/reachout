@@ -1,7 +1,6 @@
 package campaigns
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -46,10 +45,10 @@ var (
 //	message  : Body is sent DelayDays business days after the request is accepted
 //	followup : Body is sent DelayDays business days after the message if there was no reply
 type Step struct {
-	Type      string `json:"type"`
-	Note      string `json:"note,omitempty"`
-	Body      string `json:"body,omitempty"`
-	DelayDays int    `json:"delay_days,omitempty"`
+	Type      string `json:"type" bson:"type"`
+	Note      string `json:"note,omitempty" bson:"note,omitempty"`
+	Body      string `json:"body,omitempty" bson:"body,omitempty"`
+	DelayDays int    `json:"delay_days,omitempty" bson:"delay_days,omitempty"`
 }
 
 func bad(format string, a ...any) error {
@@ -164,16 +163,6 @@ type Campaign struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	Stats      Stats      `json:"stats"`
-}
-
-func unmarshalSteps(b []byte, out *[]Step) error {
-	if err := json.Unmarshal(b, out); err != nil {
-		return err
-	}
-	if len(*out) != 3 {
-		return fmt.Errorf("stored campaign has %d steps, want 3", len(*out))
-	}
-	return nil
 }
 
 func validateInput(in Input) (Input, error) {

@@ -11,7 +11,8 @@ import (
 )
 
 type Config struct {
-	DatabaseURL   string
+	MongoURI      string // MONGODB_URI: a replica set (transactions need one; Atlas always is)
+	MongoDB       string // MONGODB_DB, default "reachout"
 	Addr          string
 	LogLevel      slog.Level
 	WorkerEnabled bool // false stops all outbound sending
@@ -31,12 +32,16 @@ type Config struct {
 // Load reads settings through getenv (os.Getenv in production) so tests need no real environment.
 func Load(getenv func(string) string) (Config, error) {
 	c := Config{
-		DatabaseURL:   getenv("DATABASE_URL"),
+		MongoURI:      getenv("MONGODB_URI"),
+		MongoDB:       getenv("MONGODB_DB"),
 		Addr:          getenv("ADDR"),
 		WorkerEnabled: true,
 	}
-	if c.DatabaseURL == "" {
-		return Config{}, errors.New("DATABASE_URL is required")
+	if c.MongoURI == "" {
+		return Config{}, errors.New("MONGODB_URI is required")
+	}
+	if c.MongoDB == "" {
+		c.MongoDB = "reachout"
 	}
 	if c.Addr == "" {
 		c.Addr = ":8080"

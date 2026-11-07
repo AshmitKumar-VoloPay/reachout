@@ -10,7 +10,9 @@ import (
 
 	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/leads"
-	"github.com/jackc/pgx/v5"
+	"github.com/ashmit/reachout-server/internal/mdb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // identity is how an event names a person. Any of the three may be missing.
@@ -46,52 +48,104 @@ func (h *Handler) findLead(ctx context.Context, a account, id identity) (int64, 
 		return 0, false, nil
 	}
 
-	var leadID int64
-	err := h.pool.QueryRow(ctx,
-		`SELECT l.id FROM leads l
-		  WHERE l.user_id = $1
-		    AND EXISTS (SELECT 1 FROM campaign_leads cl JOIN campaigns c ON c.id = cl.campaign_id
-		                 WHERE cl.lead_id = l.id AND c.account_id = $2)
-		    AND (l.profile_url = ANY($3) OR l.hashed_url = ANY($3) OR ($4 <> '' AND l.linkedin_urn = $4))
-		  ORDER BY l.id LIMIT 1`,
-		a.userID, a.id, urls, id.urn).Scan(&leadID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
+	// Only campaigns of this account count, and only this user's leads can match.
+	campaignIDs, err := h.accountCampaigns(ctx, a)
+	if err != nil || len(campaignIDs) == 0 {
+		return 0, false, err
 	}
+	match := bson.A{}
+	if len(urls) > 0 {
+		urlVals := make(bson.A, len(urls))
+		for i, u := range urls {
+			urlVals[i] = u
+		}
+		match = append(match, bson.D{eq("profile_url", bson.D{{Key: "$in", Value: urlVals}})},
+			bson.D{eq("hashed_url", bson.D{{Key: "$in", Value: urlVals}})})
+	}
+	if id.urn != "" {
+		match = append(match, bson.D{eq("linkedin_urn", id.urn)})
+	}
+	cur, err := h.db.Collection(mdb.Leads).Find(ctx, bson.D{eq("user_id", a.userID), {Key: "$or", Value: match}},
+		options.Find().SetSort(bson.D{eq("_id", 1)}).SetProjection(bson.D{eq("_id", 1)}))
 	if err != nil {
 		return 0, false, err
 	}
-	// Remember the other forms of the identity, so later events that carry only one of them still match.
-	if id.urn != "" || hashed != "" {
-		if _, err := h.pool.Exec(ctx,
-			`UPDATE leads SET linkedin_urn = coalesce(linkedin_urn, nullif($1, '')), hashed_url = coalesce(hashed_url, nullif($2, ''))
-			  WHERE id = $3 AND user_id = $4`, id.urn, hashed, leadID, a.userID); err != nil {
+	var cands []struct {
+		ID int64 `bson:"_id"`
+	}
+	if err := cur.All(ctx, &cands); err != nil {
+		return 0, false, err
+	}
+	leadID, found := int64(0), false
+	for _, c := range cands { // the first (oldest) one that this account has dealt with
+		n, err := h.db.Collection(mdb.CampaignLeads).CountDocuments(ctx, bson.D{eq("lead_id", c.ID), eq("campaign_id", idsIn(campaignIDs))})
+		if err != nil {
+			return 0, false, err
+		}
+		if n > 0 {
+			leadID, found = c.ID, true
+			break
+		}
+	}
+	if !found {
+		return 0, false, nil
+	}
+	// Remember the other forms of the identity, so later events that carry only one of them
+	// still match. Only blanks are filled; a stored value is never overwritten.
+	leadsColl := h.db.Collection(mdb.Leads)
+	for field, v := range map[string]string{"linkedin_urn": id.urn, "hashed_url": hashed} {
+		if v == "" {
+			continue
+		}
+		if _, err := leadsColl.UpdateOne(ctx, bson.D{eq("_id", leadID), eq("user_id", a.userID), eq(field, bson.D{{Key: "$exists", Value: false}})},
+			bson.D{{Key: "$set", Value: bson.D{eq(field, v)}}}); err != nil {
 			return 0, false, err
 		}
 	}
 	return leadID, true, nil
 }
 
+// accountCampaigns lists the ids of this account's campaigns.
+func (h *Handler) accountCampaigns(ctx context.Context, a account) ([]int64, error) {
+	cur, err := h.db.Collection(mdb.Campaigns).Find(ctx, bson.D{eq("account_id", a.id), eq("user_id", a.userID)},
+		options.Find().SetProjection(bson.D{eq("_id", 1)}))
+	if err != nil {
+		return nil, err
+	}
+	var docs []struct {
+		ID int64 `bson:"_id"`
+	}
+	if err := cur.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	out := make([]int64, len(docs))
+	for i, d := range docs {
+		out[i] = d.ID
+	}
+	return out, nil
+}
+
 // record applies ev to the lead in every campaign of this account that includes it.
 func (h *Handler) record(ctx context.Context, a account, leadID int64, ev campaigns.Event, at time.Time) (int, error) {
-	rows, err := h.pool.Query(ctx,
-		`SELECT cl.campaign_id FROM campaign_leads cl JOIN campaigns c ON c.id = cl.campaign_id
-		  WHERE cl.lead_id = $1 AND c.account_id = $2 AND cl.user_id = $3 ORDER BY cl.campaign_id`, leadID, a.id, a.userID)
+	campaignIDs, err := h.accountCampaigns(ctx, a)
+	if err != nil || len(campaignIDs) == 0 {
+		return 0, err
+	}
+	cur, err := h.db.Collection(mdb.CampaignLeads).Find(ctx,
+		bson.D{eq("lead_id", leadID), eq("user_id", a.userID), eq("campaign_id", idsIn(campaignIDs))},
+		options.Find().SetSort(bson.D{eq("campaign_id", 1)}).SetProjection(bson.D{eq("campaign_id", 1)}))
 	if err != nil {
 		return 0, err
 	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		ids = append(ids, id)
+	var rows []struct {
+		CampaignID int64 `bson:"campaign_id"`
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	if err := cur.All(ctx, &rows); err != nil {
 		return 0, err
+	}
+	ids := make([]int64, len(rows))
+	for i, r := range rows {
+		ids[i] = r.CampaignID
 	}
 	applied := 0
 	for _, cid := range ids {
@@ -177,10 +231,16 @@ func (h *Handler) onMessageReceived(ctx context.Context, ev envelope, now time.T
 	if extID == "" {
 		extID = "event:" + ev.ID
 	}
-	if _, err := h.pool.Exec(ctx,
-		`INSERT INTO messages (lead_id, direction, body, at, external_id, thread_id)
-		 VALUES ($1, 'in', $2, $3, $4, nullif($5, '')) ON CONFLICT (lead_id, external_id) WHERE external_id IS NOT NULL DO NOTHING`,
-		leadID, body, at, extID, d.ThreadID); err != nil {
+	msgID, err := mdb.NextID(ctx, h.db, mdb.Messages)
+	if err != nil {
+		return "", err
+	}
+	msg := bson.D{eq("_id", msgID), eq("user_id", a.userID), eq("lead_id", leadID), eq("direction", "in"), eq("body", body), eq("at", at), eq("external_id", extID)}
+	if d.ThreadID != "" {
+		msg = append(msg, eq("thread_id", d.ThreadID))
+	}
+	// The unique index on (lead, external id) makes a repeat of the same message a no-op.
+	if _, err := h.db.Collection(mdb.Messages).InsertOne(ctx, msg); err != nil && !mdb.IsDup(err) {
 		return "", err
 	}
 	// A reply ends the sequence for this person, whatever step they were on.
@@ -220,15 +280,15 @@ func (h *Handler) onAccountStatus(ctx context.Context, ev envelope, now time.Tim
 	// Events can arrive out of order, so only a newer one than the last applied may change
 	// the status. Accounts that are still connecting, or failed to connect, are left alone.
 	at := orderingTime(ev.CreatedAt, now)
-	tag, err := h.pool.Exec(ctx,
-		`UPDATE linkedin_accounts SET status = $1, status_event_at = $2, status_detail = $3
-		  WHERE id = $4 AND status NOT IN ('pending','error')
-		    AND (status_event_at IS NULL OR status_event_at < $2)`,
-		accountStatus[ev.Type], at, "reported by Linked API ("+ev.Type+")", a.id)
+	res, err := h.db.Collection(mdb.Accounts).UpdateOne(ctx, bson.D{
+		eq("_id", a.id), eq("status", bson.D{{Key: "$nin", Value: bson.A{"pending", "error"}}}),
+		{Key: "$or", Value: bson.A{bson.D{eq("status_event_at", nil)}, bson.D{eq("status_event_at", bson.D{{Key: "$lt", Value: at}})}}},
+	}, bson.D{{Key: "$set", Value: bson.D{eq("status", accountStatus[ev.Type]), eq("status_event_at", at),
+		eq("status_detail", "reported by Linked API ("+ev.Type+")")}}})
 	if err != nil {
 		return "", err
 	}
-	if tag.RowsAffected() == 0 {
+	if res.MatchedCount == 0 {
 		return "stale or unchanged", nil
 	}
 	return "account " + accountStatus[ev.Type], nil

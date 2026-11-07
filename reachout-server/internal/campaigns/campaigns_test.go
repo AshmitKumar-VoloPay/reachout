@@ -21,13 +21,15 @@ import (
 	"github.com/ashmit/reachout-server/internal/httpapi"
 	"github.com/ashmit/reachout-server/internal/leads"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/testdb"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 type env struct {
 	t     *testing.T
-	pool  *pgxpool.Pool
+	db    *mongo.Database
 	svc   *Service
 	accts *accounts.Service
 	leads *leads.Service
@@ -39,21 +41,21 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	pool := testdb.New(t)
+	db := testdb.New(t)
 	key := make([]byte, 32)
 	rand.Read(key)
 	c, _ := accounts.NewCipher(key)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fake := linkedin.NewFake()
-	accts := accounts.NewService(pool, fake, c, log)
-	svc := NewService(pool, accts, log)
+	accts := accounts.NewService(db, fake, c, log)
+	svc := NewService(db, accts, log)
 
-	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: pool, Log: log, AllowedOrigins: []string{"http://localhost:5173"}})
-	aSvc := auth.NewService(pool)
+	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: mdb.Pinger{DB: db}, Log: log, AllowedOrigins: []string{"http://localhost:5173"}})
+	aSvc := auth.NewService(db)
 	ah := auth.NewHandler(aSvc, auth.Options{Log: log})
 	ah.Register(mux)
 	NewHandler(svc, ah, log).Register(mux)
-	return &env{t: t, pool: pool, svc: svc, accts: accts, leads: leads.NewService(pool, fake, accts, log),
+	return &env{t: t, db: db, svc: svc, accts: accts, leads: leads.NewService(db, fake, accts, log),
 		fake: fake, h: handler, auth: aSvc}
 }
 
@@ -119,14 +121,22 @@ func (e *env) leadIDs(u user, prefix string, n int) []int64 {
 	e.t.Helper()
 	ids := make([]int64, n)
 	for i := range ids {
-		err := e.pool.QueryRow(context.Background(),
-			`INSERT INTO leads (user_id, profile_url, name) VALUES ($1, $2, $3) RETURNING id`,
-			u.id, fmt.Sprintf("https://www.linkedin.com/in/%s-%d", prefix, i), fmt.Sprintf("%s %d", prefix, i)).Scan(&ids[i])
+		id, err := mdb.NextID(context.Background(), e.db, mdb.Leads)
 		if err != nil {
 			e.t.Fatal(err)
 		}
+		testdb.Insert(e.t, e.db, mdb.Leads, bson.D{{Key: "_id", Value: id}, {Key: "user_id", Value: u.id},
+			{Key: "profile_url", Value: fmt.Sprintf("https://www.linkedin.com/in/%s-%d", prefix, i)},
+			{Key: "name", Value: fmt.Sprintf("%s %d", prefix, i)}, {Key: "headline", Value: ""}, {Key: "company", Value: ""},
+			{Key: "created_at", Value: time.Now()}})
+		ids[i] = id
 	}
 	return ids
+}
+
+// cl reads one lead's place in a campaign straight from the database.
+func (e *env) cl(campaignID, leadID int64) clDoc {
+	return testdb.One[clDoc](e.t, e.db, mdb.CampaignLeads, bson.D{{Key: "campaign_id", Value: campaignID}, {Key: "lead_id", Value: leadID}})
 }
 
 func validSteps() []Step {
@@ -309,27 +319,6 @@ func TestTenantIsolation(t *testing.T) {
 	}
 }
 
-// The database refuses cross-user links even if application code had a bug.
-func TestDatabaseRejectsCrossTenantLinks(t *testing.T) {
-	e := newEnv(t)
-	alice, bob := e.user("alice@example.com"), e.user("bob@example.com")
-	acctA := e.account(alice)
-	c := e.campaign(alice, acctA)
-	bobLead := e.leadIDs(bob, "bo", 1)[0]
-	ctx := context.Background()
-
-	if _, err := e.pool.Exec(ctx, `INSERT INTO campaign_leads (campaign_id, lead_id, user_id) VALUES ($1, $2, $3)`, c.ID, bobLead, alice.id); err == nil {
-		t.Error("bob's lead was linked to alice's campaign")
-	}
-	if _, err := e.pool.Exec(ctx, `INSERT INTO campaign_leads (campaign_id, lead_id, user_id) VALUES ($1, $2, $3)`, c.ID, bobLead, bob.id); err == nil {
-		t.Error("bob's lead was linked under bob's id to alice's campaign")
-	}
-	if _, err := e.pool.Exec(ctx,
-		`INSERT INTO campaigns (user_id, account_id, name, steps) VALUES ($1, $2, 'x', '[]')`, bob.id, acctA); err == nil {
-		t.Error("bob created a campaign on alice's LinkedIn account")
-	}
-}
-
 func TestStartOnSaturdayQueuesUntilMonday(t *testing.T) {
 	e := newEnv(t)
 	u := e.user("a@example.com")
@@ -381,11 +370,11 @@ func TestStartRules(t *testing.T) {
 	}
 	e.svc.AddLeads(ctx, u.id, c.ID, e.leadIDs(u, "l", 2))
 
-	e.pool.Exec(ctx, `UPDATE linkedin_accounts SET status = 'reconnection_required' WHERE id = $1`, acct)
+	testdb.Update(t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: acct}}, bson.D{{Key: "status", Value: "reconnection_required"}})
 	if _, err := e.svc.Start(ctx, u.id, c.ID); !errors.Is(err, ErrAccountNotReady) {
 		t.Fatalf("disconnected account: %v", err)
 	}
-	e.pool.Exec(ctx, `UPDATE linkedin_accounts SET status = 'connected' WHERE id = $1`, acct)
+	testdb.Update(t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: acct}}, bson.D{{Key: "status", Value: "connected"}})
 
 	if _, err := e.svc.Start(ctx, u.id, c.ID); err != nil {
 		t.Fatal(err)
@@ -394,9 +383,7 @@ func TestStartRules(t *testing.T) {
 		t.Fatalf("start twice: %v", err)
 	}
 	// Nothing was queued by the failed attempts.
-	var n int
-	e.pool.QueryRow(ctx, `SELECT count(*) FROM campaign_leads WHERE next_action_at IS NULL AND state = 'queued'`).Scan(&n)
-	if n != 0 {
+	if n := testdb.Count(t, e.db, mdb.CampaignLeads, bson.D{{Key: "next_action_at", Value: nil}, {Key: "state", Value: "queued"}}); n != 0 {
 		t.Fatalf("%d leads without a due time after start", n)
 	}
 }
@@ -418,9 +405,7 @@ func TestAddLeadsRules(t *testing.T) {
 		t.Fatalf("second add: %+v", res)
 	}
 	// In a draft the leads wait for Start: no due time yet.
-	var due *time.Time
-	e.pool.QueryRow(ctx, `SELECT next_action_at FROM campaign_leads WHERE lead_id = $1`, ids[0]).Scan(&due)
-	if due != nil {
+	if due := e.cl(c.ID, ids[0]).NextActionAt; due != nil {
 		t.Fatalf("draft lead has a due time: %v", due)
 	}
 	for _, bad := range [][]int64{nil, make([]int64, MaxAddPerRequest+1)} {
@@ -435,7 +420,7 @@ func TestAddLeadsRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, _ = e.svc.AddLeads(ctx, u.id, c.ID, []int64{ids[3]})
-	e.pool.QueryRow(ctx, `SELECT next_action_at FROM campaign_leads WHERE lead_id = $1`, ids[3]).Scan(&due)
+	due := e.cl(c.ID, ids[3]).NextActionAt
 	if res.Added != 1 || due == nil || !due.Equal(mon0930) {
 		t.Fatalf("add to running: %+v due=%v", res, due)
 	}
@@ -452,8 +437,9 @@ func TestCampaignLeadCap(t *testing.T) {
 	c := e.campaign(u, e.account(u))
 	ctx := context.Background()
 	// Fill the campaign to its limit directly, then try to add more through the service.
-	e.pool.Exec(ctx, `INSERT INTO leads (user_id, profile_url) SELECT $1, 'https://www.linkedin.com/in/bulk-' || g FROM generate_series(1, $2) g`, u.id, MaxCampaignLeads)
-	e.pool.Exec(ctx, `INSERT INTO campaign_leads (campaign_id, lead_id, user_id) SELECT $1, id, user_id FROM leads WHERE user_id = $2`, c.ID, u.id)
+	for _, id := range e.leadIDs(u, "bulk", MaxCampaignLeads) {
+		testdb.Insert(t, e.db, mdb.CampaignLeads, clDoc{CampaignID: c.ID, LeadID: id, UserID: u.id, State: StateQueued, UpdatedAt: time.Now()})
+	}
 	extra := e.leadIDs(u, "extra", 2)
 	res, err := e.svc.AddLeads(ctx, u.id, c.ID, extra)
 	if err != nil || res.OverCap != 2 || res.Added != 0 {
@@ -632,9 +618,7 @@ func TestRemoveLead(t *testing.T) {
 		t.Fatalf("remove contacted lead: %v", err)
 	}
 	// The lead itself still exists and is untouched.
-	var n int
-	e.pool.QueryRow(ctx, `SELECT count(*) FROM leads WHERE id = ANY($1)`, ids).Scan(&n)
-	if n != 2 {
+	if n := testdb.Count(t, e.db, mdb.Leads, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}); n != 2 {
 		t.Fatalf("leads deleted: %d", n)
 	}
 }
@@ -684,9 +668,7 @@ func TestRecordFollowsBusinessDays(t *testing.T) {
 		return st, out
 	}
 	due := func() *time.Time {
-		var d *time.Time
-		e.pool.QueryRow(ctx, `SELECT next_action_at FROM campaign_leads WHERE campaign_id = $1 AND lead_id = $2`, c.ID, lead).Scan(&d)
-		return d
+		return e.cl(c.ID, lead).NextActionAt
 	}
 
 	// Request sent: now waiting for the acceptance, nothing scheduled.
@@ -728,9 +710,8 @@ func TestRecordAfterHoursSnapsToNextWindow(t *testing.T) {
 	// Accepted Friday 19:00 (outside hours) with message delay 1: Monday 19:00 is also outside,
 	// so the message waits for Tuesday 09:30. It never lands outside the window.
 	e.svc.Record(ctx, c.ID, ids[0], EvAccepted, utc(2026, 11, 6, 19, 0), "")
-	var due time.Time
-	e.pool.QueryRow(ctx, `SELECT next_action_at FROM campaign_leads WHERE lead_id = $1`, ids[0]).Scan(&due)
-	if !due.Equal(utc(2026, 11, 10, 9, 30)) {
+	due := e.cl(c.ID, ids[0]).NextActionAt
+	if due == nil || !due.Equal(utc(2026, 11, 10, 9, 30)) {
 		t.Fatalf("due %v, want Tuesday 09:30", due)
 	}
 }
@@ -749,9 +730,8 @@ func TestRecordReplyStopsEverything(t *testing.T) {
 	if err != nil || st != StateReplied || out != Applied {
 		t.Fatalf("reply: %s %v %v", st, out, err)
 	}
-	var due *time.Time
-	var step int
-	e.pool.QueryRow(ctx, `SELECT next_action_at, current_step FROM campaign_leads WHERE lead_id = $1`, a).Scan(&due, &step)
+	after := e.cl(c.ID, a)
+	due, step := after.NextActionAt, after.CurrentStep
 	if due != nil || step != 3 {
 		t.Fatalf("after reply: due=%v step=%d (want no due time and the message step kept)", due, step)
 	}
@@ -810,9 +790,8 @@ func TestRecordOnStoppedCampaignStillRecordsReplies(t *testing.T) {
 
 	// Acceptance arrives after the stop: the state moves, but nothing is scheduled.
 	e.svc.Record(ctx, c.ID, ids[0], EvAccepted, tue11, "")
-	var due *time.Time
-	var state State
-	e.pool.QueryRow(ctx, `SELECT next_action_at, state FROM campaign_leads WHERE lead_id = $1`, ids[0]).Scan(&due, &state)
+	stopped := e.cl(c.ID, ids[0])
+	due, state := stopped.NextActionAt, stopped.State
 	if state != StateConnected || due != nil {
 		t.Fatalf("after stop: state=%s due=%v", state, due)
 	}
@@ -840,10 +819,8 @@ func TestConcurrentEventsEndConsistent(t *testing.T) {
 		}(ev)
 	}
 	wg.Wait()
-	var state State
-	var due *time.Time
-	var step int
-	e.pool.QueryRow(ctx, `SELECT state, next_action_at, current_step FROM campaign_leads WHERE lead_id = $1`, ids[0]).Scan(&state, &due, &step)
+	final := e.cl(c.ID, ids[0])
+	state, due, step := final.State, final.NextActionAt, final.CurrentStep
 	// Whatever the interleaving, a reply is in the set, so the lead must end replied with
 	// nothing scheduled, and the step can only be one a legal path could have reached.
 	if state != StateReplied || due != nil || step < 1 || step > 3 {

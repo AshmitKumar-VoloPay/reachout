@@ -5,13 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/ashmit/reachout-server/internal/accounts"
 	"github.com/ashmit/reachout-server/internal/linkedin"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ashmit/reachout-server/internal/mdb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 const (
@@ -51,21 +54,21 @@ type Lead struct {
 }
 
 type Service struct {
-	pool *pgxpool.Pool
-	li   linkedin.Client
-	acc  Accounts
-	log  *slog.Logger
-	now  func() time.Time
+	db  *mongo.Database
+	li  linkedin.Client
+	acc Accounts
+	log *slog.Logger
+	now func() time.Time
 
 	// MaxLeads is the per-user lead limit (MaxLeadsPerUser unless a test lowers it).
 	MaxLeads int
 }
 
-func NewService(pool *pgxpool.Pool, li linkedin.Client, acc Accounts, log *slog.Logger) *Service {
+func NewService(db *mongo.Database, li linkedin.Client, acc Accounts, log *slog.Logger) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Service{pool: pool, li: li, acc: acc, log: log, now: time.Now, MaxLeads: MaxLeadsPerUser}
+	return &Service{db: db, li: li, acc: acc, log: log, now: time.Now, MaxLeads: MaxLeadsPerUser}
 }
 
 type InvalidURL struct {
@@ -109,69 +112,122 @@ func (s *Service) ImportURLs(ctx context.Context, userID int64, text string, url
 		seen[n] = true
 		cands = append(cands, candidate{url: n})
 	}
-	err := s.inTx(ctx, userID, func(tx pgx.Tx) error { return s.insert(ctx, tx, userID, cands, &res) })
+	added, err := s.insert(ctx, userID, cands)
+	res.Imported += added.Imported
+	res.Duplicates += added.Duplicates
+	res.OverCap += added.OverCap
 	return res, err
 }
 
-// inTx runs fn in a transaction holding a per-user lock, so two imports for the same user
-// cannot both pass the lead-limit check and exceed it.
-func (s *Service) inTx(ctx context.Context, userID int64, fn func(pgx.Tx) error) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7264520, $1)`, int32(userID)); err != nil {
-		return err
-	}
-	if err := fn(tx); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+// leadDoc is the stored lead.
+type leadDoc struct {
+	ID          int64     `bson:"_id"`
+	UserID      int64     `bson:"user_id"`
+	ProfileURL  string    `bson:"profile_url"`
+	Name        string    `bson:"name"`
+	Headline    string    `bson:"headline"`
+	Company     string    `bson:"company"`
+	CreatedAt   time.Time `bson:"created_at"`
+	LinkedInURN *string   `bson:"linkedin_urn,omitempty"`
+	HashedURL   *string   `bson:"hashed_url,omitempty"`
 }
 
-// insert upserts candidates for userID and adds the outcome to res. Existing leads keep
-// their data, but blank name/headline fields are filled from the new import.
-func (s *Service) insert(ctx context.Context, tx pgx.Tx, userID int64, cands []candidate, res *ImportResult) error {
-	var total int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM leads WHERE user_id = $1`, userID).Scan(&total); err != nil {
-		return err
-	}
-	for _, c := range cands {
-		if total >= s.MaxLeads {
-			// At the limit only existing leads can be touched; anything new is skipped.
-			var exists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM leads WHERE user_id = $1 AND profile_url = $2)`,
-				userID, c.url).Scan(&exists); err != nil {
-				return err
-			}
-			if exists {
-				res.Duplicates++
-			} else {
-				res.OverCap++
-			}
-			continue
-		}
-		var inserted bool
-		err := tx.QueryRow(ctx,
-			`INSERT INTO leads (user_id, profile_url, name, headline, linkedin_urn) VALUES ($1, $2, $3, $4, nullif($5, ''))
-			 ON CONFLICT (user_id, profile_url) DO UPDATE
-			   SET name         = CASE WHEN leads.name = ''     THEN EXCLUDED.name     ELSE leads.name END,
-			       headline     = CASE WHEN leads.headline = '' THEN EXCLUDED.headline ELSE leads.headline END,
-			       linkedin_urn = coalesce(leads.linkedin_urn, EXCLUDED.linkedin_urn)
-			 RETURNING (xmax = 0)`,
-			userID, c.url, c.name, c.headline, c.urn).Scan(&inserted)
-		if err != nil {
+func (d leadDoc) lead() Lead {
+	return Lead{ID: d.ID, ProfileURL: d.ProfileURL, Name: d.Name, Headline: d.Headline, Company: d.Company, CreatedAt: d.CreatedAt}
+}
+
+func (s *Service) coll() *mongo.Collection { return s.db.Collection(mdb.Leads) }
+
+func eq(k string, v any) bson.E { return bson.E{Key: k, Value: v} }
+
+// inTx runs fn in a transaction that first takes a per-user lock, so two imports for the
+// same user cannot both pass the lead-limit check and exceed it. fn may run more than once
+// (the transaction is retried on a conflict), so it must not carry state between attempts.
+func (s *Service) inTx(ctx context.Context, userID int64, fn func(ctx context.Context) error) error {
+	return mdb.WithTx(ctx, s.db, func(ctx context.Context) error {
+		if err := mdb.Lock(ctx, s.db.Collection(mdb.Counters), bson.D{eq("_id", fmt.Sprintf("leads:%d", userID))}); err != nil {
 			return err
 		}
-		if inserted {
-			res.Imported++
-			total++
-		} else {
-			res.Duplicates++
+		return fn(ctx)
+	})
+}
+
+// insert adds the candidates in a transaction of its own. Ids are reserved up front:
+// allocating inside the transaction would make every import queue on the counter document.
+func (s *Service) insert(ctx context.Context, userID int64, cands []candidate) (ImportResult, error) {
+	if len(cands) == 0 {
+		return ImportResult{}, nil
+	}
+	first, err := mdb.NextIDs(ctx, s.db, mdb.Leads, len(cands))
+	if err != nil {
+		return ImportResult{}, err
+	}
+	var out ImportResult
+	err = s.inTx(ctx, userID, func(ctx context.Context) (err error) {
+		out, err = s.insertTx(ctx, userID, cands, first)
+		return err
+	})
+	return out, err
+}
+
+// insertTx upserts candidates for userID inside a transaction the caller has opened with inTx
+// (so the per-user lock is held), using ids first, first+1, ... Existing leads keep their data,
+// but blank name, headline and URN fields are filled from the new import.
+func (s *Service) insertTx(ctx context.Context, userID int64, cands []candidate, first int64) (ImportResult, error) {
+	var out ImportResult
+	{
+		total, err := s.coll().CountDocuments(ctx, bson.D{eq("user_id", userID)})
+		if err != nil {
+			return out, err
+		}
+		now := s.now()
+		for i, c := range cands {
+			key := bson.D{eq("user_id", userID), eq("profile_url", c.url)}
+			if int(total) >= s.MaxLeads {
+				// At the limit only existing leads can be touched; anything new is skipped.
+				n, err := s.coll().CountDocuments(ctx, key)
+				if err != nil {
+					return out, err
+				}
+				if n > 0 {
+					out.Duplicates++
+				} else {
+					out.OverCap++
+				}
+				continue
+			}
+			setOnInsert := bson.D{eq("_id", first+int64(i)), eq("created_at", now), eq("company", "")}
+			// name, headline and URN are set on insert only when given; blanks on an existing lead are filled below.
+			setOnInsert = append(setOnInsert, eq("name", c.name), eq("headline", c.headline))
+			if c.urn != "" {
+				setOnInsert = append(setOnInsert, eq("linkedin_urn", c.urn))
+			}
+			r, err := s.coll().UpdateOne(ctx, key, bson.D{{Key: "$setOnInsert", Value: setOnInsert}}, options.UpdateOne().SetUpsert(true))
+			if err != nil {
+				return out, err
+			}
+			if r.UpsertedCount == 1 {
+				out.Imported++
+				total++
+				continue
+			}
+			out.Duplicates++
+			for field, v := range map[string]string{"name": c.name, "headline": c.headline} {
+				if v != "" {
+					if _, err := s.coll().UpdateOne(ctx, append(bson.D{}, append(key, eq(field, ""))...), bson.D{{Key: "$set", Value: bson.D{eq(field, v)}}}); err != nil {
+						return out, err
+					}
+				}
+			}
+			if c.urn != "" {
+				if _, err := s.coll().UpdateOne(ctx, append(bson.D{}, append(key, eq("linkedin_urn", bson.D{{Key: "$exists", Value: false}}))...),
+					bson.D{{Key: "$set", Value: bson.D{eq("linkedin_urn", c.urn)}}}); err != nil {
+					return out, err
+				}
+			}
 		}
 	}
-	return nil
+	return out, nil
 }
 
 // ListParams filters and pages the lead list.
@@ -188,10 +244,6 @@ type Page struct {
 	Offset int    `json:"offset"`
 }
 
-func escapeLike(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
-}
-
 func (s *Service) List(ctx context.Context, userID int64, p ListParams) (Page, error) {
 	if p.Limit <= 0 {
 		p.Limit = DefaultPageSize
@@ -202,63 +254,122 @@ func (s *Service) List(ctx context.Context, userID int64, p ListParams) (Page, e
 	if p.Offset < 0 {
 		p.Offset = 0
 	}
-	pattern := "%" + escapeLike(strings.TrimSpace(p.Query)) + "%"
-	const where = `user_id = $1 AND (name ILIKE $2 ESCAPE '\' OR headline ILIKE $2 ESCAPE '\'
-	                OR company ILIKE $2 ESCAPE '\' OR profile_url ILIKE $2 ESCAPE '\')`
+	// The search text is matched literally (QuoteMeta), case-insensitively, anywhere in the fields.
+	re := bson.Regex{Pattern: regexp.QuoteMeta(strings.TrimSpace(p.Query)), Options: "i"}
+	filter := bson.D{eq("user_id", userID), {Key: "$or", Value: bson.A{
+		bson.D{eq("name", re)}, bson.D{eq("headline", re)}, bson.D{eq("company", re)}, bson.D{eq("profile_url", re)},
+	}}}
 
 	page := Page{Leads: []Lead{}, Limit: p.Limit, Offset: p.Offset}
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM leads WHERE `+where, userID, pattern).Scan(&page.Total); err != nil {
-		return Page{}, err
-	}
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, profile_url, name, headline, company, created_at FROM leads
-		  WHERE `+where+` ORDER BY id DESC LIMIT $3 OFFSET $4`, userID, pattern, p.Limit, p.Offset)
+	total, err := s.coll().CountDocuments(ctx, filter)
 	if err != nil {
 		return Page{}, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var l Lead
-		if err := rows.Scan(&l.ID, &l.ProfileURL, &l.Name, &l.Headline, &l.Company, &l.CreatedAt); err != nil {
-			return Page{}, err
-		}
-		page.Leads = append(page.Leads, l)
+	page.Total = int(total)
+	cur, err := s.coll().Find(ctx, filter, options.Find().SetSort(bson.D{eq("_id", -1)}).SetSkip(int64(p.Offset)).SetLimit(int64(p.Limit)))
+	if err != nil {
+		return Page{}, err
 	}
-	return page, rows.Err()
+	var docs []leadDoc
+	if err := cur.All(ctx, &docs); err != nil {
+		return Page{}, err
+	}
+	for _, d := range docs {
+		page.Leads = append(page.Leads, d.lead())
+	}
+	return page, nil
 }
 
 func (s *Service) Get(ctx context.Context, userID, id int64) (Lead, error) {
-	var l Lead
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, profile_url, name, headline, company, created_at FROM leads WHERE id = $1 AND user_id = $2`,
-		id, userID).Scan(&l.ID, &l.ProfileURL, &l.Name, &l.Headline, &l.Company, &l.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var d leadDoc
+	err := s.coll().FindOne(ctx, bson.D{eq("_id", id), eq("user_id", userID)}).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
 		return Lead{}, ErrNotFound
 	}
-	return l, err
+	return d.lead(), err
 }
 
-// inActiveCampaign is true for a leads row l that sits in a running or paused campaign.
+// inActiveCampaign returns which of the given leads sit in a running or paused campaign.
 // Deleting such a lead would silently pull a prospect out of a live sequence, so it is
 // refused: remove the lead from the campaign or stop the campaign first.
-const inActiveCampaign = `EXISTS (SELECT 1 FROM campaign_leads cl JOIN campaigns c ON c.id = cl.campaign_id
-	WHERE cl.lead_id = l.id AND c.status IN ('running','paused'))`
+func (s *Service) inActiveCampaign(ctx context.Context, leadIDs []int64) (map[int64]bool, error) {
+	cur, err := s.db.Collection(mdb.CampaignLeads).Find(ctx, bson.D{eq("lead_id", bson.D{{Key: "$in", Value: leadIDs}})})
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		CampaignID int64 `bson:"campaign_id"`
+		LeadID     int64 `bson:"lead_id"`
+	}
+	if err := cur.All(ctx, &rows); err != nil {
+		return nil, err
+	}
+	var campaignIDs []int64
+	for _, r := range rows {
+		campaignIDs = append(campaignIDs, r.CampaignID)
+	}
+	active := map[int64]bool{}
+	cc, err := s.db.Collection(mdb.Campaigns).Find(ctx, bson.D{
+		eq("_id", bson.D{{Key: "$in", Value: campaignIDs}}), eq("status", bson.D{{Key: "$in", Value: bson.A{"running", "paused"}}}),
+	}, options.Find().SetProjection(bson.D{eq("_id", 1)}))
+	if err != nil {
+		return nil, err
+	}
+	var live []struct {
+		ID int64 `bson:"_id"`
+	}
+	if err := cc.All(ctx, &live); err != nil {
+		return nil, err
+	}
+	liveSet := map[int64]bool{}
+	for _, c := range live {
+		liveSet[c.ID] = true
+	}
+	for _, r := range rows {
+		if liveSet[r.CampaignID] {
+			active[r.LeadID] = true
+		}
+	}
+	return active, nil
+}
+
+// remove deletes the leads and what hung off them (campaign entries in drafts, stopped and
+// finished campaigns, and their messages). MongoDB has no cascading deletes, so it is done here.
+func (s *Service) remove(ctx context.Context, userID int64, ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	in := bson.D{{Key: "$in", Value: ids}}
+	r, err := s.coll().DeleteMany(ctx, bson.D{eq("_id", in), eq("user_id", userID)})
+	if err != nil {
+		return 0, err
+	}
+	if r.DeletedCount > 0 {
+		if _, err := s.db.Collection(mdb.CampaignLeads).DeleteMany(ctx, bson.D{eq("lead_id", in), eq("user_id", userID)}); err != nil {
+			return r.DeletedCount, err
+		}
+		if _, err := s.db.Collection(mdb.Messages).DeleteMany(ctx, bson.D{eq("lead_id", in)}); err != nil {
+			return r.DeletedCount, err
+		}
+	}
+	return r.DeletedCount, nil
+}
 
 // Delete removes one lead. Campaign entries in drafts, stopped and finished campaigns go
-// with it (ON DELETE CASCADE); a lead in a running or paused campaign is refused.
+// with it; a lead in a running or paused campaign is refused.
 func (s *Service) Delete(ctx context.Context, userID, id int64) error {
-	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM leads l WHERE l.id = $1 AND l.user_id = $2 AND NOT `+inActiveCampaign, id, userID)
+	if _, err := s.Get(ctx, userID, id); err != nil {
+		return err // not found, or not this user's
+	}
+	active, err := s.inActiveCampaign(ctx, []int64{id})
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 1 {
-		return nil
+	if active[id] {
+		return ErrInActiveCampaign
 	}
-	if _, err := s.Get(ctx, userID, id); err != nil {
-		return err // not found
-	}
-	return ErrInActiveCampaign
+	_, err = s.remove(ctx, userID, []int64{id})
+	return err
 }
 
 // DeleteMany removes the listed leads that belong to userID. It returns how many were
@@ -268,14 +379,38 @@ func (s *Service) DeleteMany(ctx context.Context, userID int64, ids []int64) (de
 	if len(ids) == 0 || len(ids) > MaxBulkDelete {
 		return 0, 0, fmt.Errorf("%w: send between 1 and %d ids", ErrInvalidInput, MaxBulkDelete)
 	}
-	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM leads l WHERE l.user_id = $1 AND l.id = ANY($2) AND NOT `+inActiveCampaign, userID, ids)
+	cur, err := s.coll().Find(ctx, bson.D{eq("_id", bson.D{{Key: "$in", Value: ids}}), eq("user_id", userID)},
+		options.Find().SetProjection(bson.D{eq("_id", 1)}))
 	if err != nil {
 		return 0, 0, err
 	}
-	err = s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM leads l WHERE l.user_id = $1 AND l.id = ANY($2) AND `+inActiveCampaign, userID, ids).Scan(&blocked)
-	return tag.RowsAffected(), blocked, err
+	var owned []struct {
+		ID int64 `bson:"_id"`
+	}
+	if err := cur.All(ctx, &owned); err != nil {
+		return 0, 0, err
+	}
+	ownedIDs := make([]int64, 0, len(owned))
+	for _, o := range owned {
+		ownedIDs = append(ownedIDs, o.ID)
+	}
+	if len(ownedIDs) == 0 {
+		return 0, 0, nil
+	}
+	active, err := s.inActiveCampaign(ctx, ownedIDs)
+	if err != nil {
+		return 0, 0, err
+	}
+	var deletable []int64
+	for _, id := range ownedIDs {
+		if active[id] {
+			blocked++
+		} else {
+			deletable = append(deletable, id)
+		}
+	}
+	deleted, err = s.remove(ctx, userID, deletable)
+	return deleted, blocked, err
 }
 
 func truncate(s string, n int) string {

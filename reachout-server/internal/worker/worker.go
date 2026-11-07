@@ -15,16 +15,18 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/ashmit/reachout-server/internal/accounts"
 	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/schedule"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // Attempt kinds (send_attempts.kind).
@@ -92,26 +94,26 @@ func DefaultConfig() Config {
 }
 
 type Worker struct {
-	pool *pgxpool.Pool
-	acc  Accounts
-	rec  Recorder
-	li   linkedin.Client
-	cfg  Config
-	log  *slog.Logger
-	now  func() time.Time
+	db  *mongo.Database
+	acc Accounts
+	rec Recorder
+	li  linkedin.Client
+	cfg Config
+	log *slog.Logger
+	now func() time.Time
 
 	rngMu sync.Mutex
 	rng   *rand.Rand
 }
 
-func New(pool *pgxpool.Pool, acc Accounts, rec Recorder, li linkedin.Client, cfg Config, log *slog.Logger) *Worker {
+func New(db *mongo.Database, acc Accounts, rec Recorder, li linkedin.Client, cfg Config, log *slog.Logger) *Worker {
 	if log == nil {
 		log = slog.Default()
 	}
 	if cfg.Concurrency < 1 {
 		cfg.Concurrency = 1
 	}
-	return &Worker{pool: pool, acc: acc, rec: rec, li: li, cfg: cfg, log: log, now: time.Now,
+	return &Worker{db: db, acc: acc, rec: rec, li: li, cfg: cfg, log: log, now: time.Now,
 		rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
 }
 
@@ -172,32 +174,80 @@ func (w *Worker) Tick(ctx context.Context) {
 }
 
 func (w *Worker) accountsWithDueWork(ctx context.Context) ([]int64, error) {
-	// Accounts with a send due, plus connected accounts whose event feeds are not on yet.
-	rows, err := w.pool.Query(ctx,
-		`SELECT account_id FROM (
-		    SELECT c.account_id
-		      FROM campaign_leads cl
-		      JOIN campaigns c ON c.id = cl.campaign_id
-		      JOIN linkedin_accounts a ON a.id = c.account_id
-		     WHERE c.status = 'running' AND a.status = 'connected'
-		       AND cl.state IN ('queued','connected','messaged') AND cl.next_action_at <= $1
-		    UNION
-		    SELECT id FROM linkedin_accounts
-		     WHERE status = 'connected' AND (network_synced_at IS NULL OR inbox_synced_at IS NULL)
-		  ) x ORDER BY account_id`, w.now())
+	now := w.now()
+	set := map[int64]bool{}
+
+	// Accounts with a send due: running campaigns that have a due lead, on a connected account.
+	cc, err := w.campaignsColl().Find(ctx, bson.D{eq("status", "running")}, options.Find().SetProjection(bson.D{eq("account_id", 1)}))
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+	var running []struct {
+		ID        int64 `bson:"_id"`
+		AccountID int64 `bson:"account_id"`
+	}
+	if err := cc.All(ctx, &running); err != nil {
+		return nil, err
+	}
+	if len(running) > 0 {
+		accountOf := map[int64]int64{}
+		campaignIDs := make([]int64, len(running))
+		for i, c := range running {
+			accountOf[c.ID] = c.AccountID
+			campaignIDs[i] = c.ID
+		}
+		var due []int64
+		if err := w.db.Collection(mdb.CampaignLeads).Distinct(ctx, "campaign_id", bson.D{
+			eq("campaign_id", idsIn(campaignIDs)), eq("state", bson.D{{Key: "$in", Value: bson.A{"queued", "connected", "messaged"}}}),
+			eq("next_action_at", bson.D{{Key: "$lte", Value: now}}),
+		}).Decode(&due); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		var candidates []int64
+		for _, c := range due {
+			candidates = append(candidates, accountOf[c])
+		}
+		if len(candidates) > 0 {
+			ac, err := w.accountsColl().Find(ctx, bson.D{eq("_id", idsIn(candidates)), eq("status", "connected")},
+				options.Find().SetProjection(bson.D{eq("_id", 1)}))
+			if err != nil {
+				return nil, err
+			}
+			var ok []struct {
+				ID int64 `bson:"_id"`
+			}
+			if err := ac.All(ctx, &ok); err != nil {
+				return nil, err
+			}
+			for _, a := range ok {
+				set[a.ID] = true
+			}
+		}
 	}
-	return ids, rows.Err()
+
+	// Connected accounts whose event feeds are not on yet.
+	sc, err := w.accountsColl().Find(ctx, bson.D{eq("status", "connected"), {Key: "$or", Value: bson.A{
+		bson.D{eq("network_synced_at", nil)}, bson.D{eq("inbox_synced_at", nil)},
+	}}}, options.Find().SetProjection(bson.D{eq("_id", 1)}))
+	if err != nil {
+		return nil, err
+	}
+	var unsynced []struct {
+		ID int64 `bson:"_id"`
+	}
+	if err := sc.All(ctx, &unsynced); err != nil {
+		return nil, err
+	}
+	for _, a := range unsynced {
+		set[a.ID] = true
+	}
+
+	out := make([]int64, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 // state each kind of send starts from.
@@ -304,6 +354,8 @@ func (w *Worker) processAccount(ctx context.Context, accountID int64) {
 			return
 		case claimBusy:
 			return // another worker took this account
+		case claimStale:
+			return // the lead changed while we were claiming it: look again next tick
 		}
 		// Nothing eligible. If leads are still due they belong to campaigns that reached
 		// their own daily limit, so they wait for tomorrow. (Skipped if a send is in flight:
@@ -317,9 +369,11 @@ func (w *Worker) processAccount(ctx context.Context, accountID int64) {
 // syncPending starts whichever sync task is still missing and reports whether any is. It
 // returns true while sync is incomplete, even when it is waiting to retry after a failure.
 func (w *Worker) syncPending(ctx context.Context, accountID int64, now time.Time) bool {
-	var network, inbox *time.Time
-	if err := w.pool.QueryRow(ctx,
-		`SELECT network_synced_at, inbox_synced_at FROM linkedin_accounts WHERE id = $1`, accountID).Scan(&network, &inbox); err != nil {
+	var acct struct {
+		Network *time.Time `bson:"network_synced_at"`
+		Inbox   *time.Time `bson:"inbox_synced_at"`
+	}
+	if err := w.accountsColl().FindOne(ctx, bson.D{eq("_id", accountID)}).Decode(&acct); err != nil {
 		w.log.Error("read sync state", "account", accountID, "err", err)
 		return true // when in doubt, do not send
 	}
@@ -327,18 +381,19 @@ func (w *Worker) syncPending(ctx context.Context, accountID int64, now time.Time
 	for _, task := range []struct {
 		kind string
 		done *time.Time
-	}{{kindSyncNetwork, network}, {kindSyncInbox, inbox}} {
+	}{{kindSyncNetwork, acct.Network}, {kindSyncInbox, acct.Inbox}} {
 		if task.done != nil {
 			continue
 		}
 		pending = true
-		var last *time.Time
-		if err := w.pool.QueryRow(ctx, `SELECT max(created_at) FROM send_attempts WHERE account_id = $1 AND kind = $2`,
-			accountID, task.kind).Scan(&last); err != nil {
+		var last attemptDoc
+		err := w.attempts().FindOne(ctx, bson.D{eq("account_id", accountID), eq("kind", task.kind)},
+			options.FindOne().SetSort(bson.D{eq("created_at", -1)})).Decode(&last)
+		if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
 			w.log.Error("read sync history", "account", accountID, "err", err)
 			return true
 		}
-		if last != nil && now.Sub(*last) < syncRetry {
+		if err == nil && now.Sub(last.CreatedAt) < syncRetry {
 			continue // tried recently and it did not work: wait before trying again
 		}
 		t, res, err := w.claimSync(ctx, accountID, task.kind, now)
@@ -357,52 +412,57 @@ func (w *Worker) syncPending(ctx context.Context, accountID int64, now time.Time
 // claimSync records a sync task for the account. It uses the same one-open-task-per-account
 // index as sends, so a sync never runs alongside a send.
 func (w *Worker) claimSync(ctx context.Context, accountID int64, kind string, now time.Time) (*toSend, claimResult, error) {
-	t := toSend{attempt: attempt{accountID: accountID, kind: kind, status: statusStarting, createdAt: now}}
-	err := w.pool.QueryRow(ctx,
-		`INSERT INTO send_attempts (user_id, account_id, campaign_id, lead_id, kind, status, created_at, updated_at)
-		 SELECT user_id, id, 0, 0, $2, 'starting', $3, $3 FROM linkedin_accounts WHERE id = $1
-		 RETURNING id, user_id`, accountID, kind, now).Scan(&t.id, &t.userID)
+	var acct struct {
+		UserID int64 `bson:"user_id"`
+	}
+	if err := w.accountsColl().FindOne(ctx, bson.D{eq("_id", accountID)}).Decode(&acct); err != nil {
+		return nil, claimNone, err
+	}
+	id, err := mdb.NextID(ctx, w.db, mdb.SendAttempts)
 	if err != nil {
-		var pg *pgconn.PgError
-		if errors.As(err, &pg) && pg.Code == "23505" {
+		return nil, claimNone, err
+	}
+	if _, err := w.attempts().InsertOne(ctx, attemptDoc{ID: id, UserID: acct.UserID, AccountID: accountID, Kind: kind,
+		Status: statusStarting, Open: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+		if mdb.IsDup(err) {
 			return nil, claimBusy, nil
 		}
 		return nil, claimNone, err
 	}
-	return &t, claimed, nil
+	return &toSend{attempt: attempt{id: id, userID: acct.UserID, accountID: accountID, kind: kind, status: statusStarting, createdAt: now}}, claimed, nil
 }
 
 func (w *Worker) hasOpenAttempt(ctx context.Context, accountID int64) (bool, error) {
-	var open bool
-	err := w.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM send_attempts WHERE account_id = $1 AND status IN ('starting','submitted'))`,
-		accountID).Scan(&open)
-	return open, err
+	n, err := w.attempts().CountDocuments(ctx, bson.D{eq("account_id", accountID), eq("open", true)})
+	return n > 0, err
 }
 
 // usedToday counts today's attempts per kind of cap. Failed attempts do not count: LinkedIn
 // never performed them. 'unknown' ones do, because they may have been performed.
 func (w *Worker) usedToday(ctx context.Context, accountID int64, from, to time.Time) (map[schedule.Kind]int, error) {
-	rows, err := w.pool.Query(ctx,
-		`SELECT kind, count(*) FROM send_attempts
-		  WHERE account_id = $1 AND created_at >= $2 AND created_at < $3
-		    AND kind IN ('connect','message','followup')
-		    AND status IN ('starting','submitted','succeeded','unknown')
-		  GROUP BY kind`, accountID, from, to)
+	cur, err := w.attempts().Aggregate(ctx, mongo.Pipeline{
+		{{Key: "$match", Value: bson.D{
+			eq("account_id", accountID), eq("created_at", bson.D{{Key: "$gte", Value: from}, {Key: "$lt", Value: to}}),
+			eq("kind", bson.D{{Key: "$in", Value: bson.A{kindConnect, kindMessage, kindFollowUp}}}),
+			eq("status", bson.D{{Key: "$in", Value: countedStatuses}}),
+		}}},
+		{{Key: "$group", Value: bson.D{eq("_id", "$kind"), eq("n", bson.D{{Key: "$sum", Value: 1}})}}},
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	used := map[schedule.Kind]int{}
-	for rows.Next() {
-		var kind string
-		var n int
-		if err := rows.Scan(&kind, &n); err != nil {
-			return nil, err
-		}
-		used[schedKind(kind)] += n
+	var rows []struct {
+		Kind string `bson:"_id"`
+		N    int    `bson:"n"`
 	}
-	return used, rows.Err()
+	if err := cur.All(ctx, &rows); err != nil {
+		return nil, err
+	}
+	used := map[schedule.Kind]int{}
+	for _, r := range rows {
+		used[schedKind(r.Kind)] += r.N
+	}
+	return used, nil
 }
 
 type claimResult int
@@ -411,6 +471,7 @@ const (
 	claimNone claimResult = iota
 	claimed
 	claimBusy
+	claimStale // the lead was no longer due when we came to claim it
 )
 
 // attempt is one row of send_attempts.
@@ -432,64 +493,130 @@ type toSend struct {
 // open attempts keeps them off the same account. Nothing else touches the connection pool
 // while the transaction is open.
 func (w *Worker) claim(ctx context.Context, accountID int64, kind string, dayStart, dayEnd, now time.Time) (*toSend, claimResult, error) {
-	tx, err := w.pool.Begin(ctx)
+	// The account's running campaigns.
+	cc, err := w.campaignsColl().Find(ctx, bson.D{eq("account_id", accountID), eq("status", "running")})
 	if err != nil {
 		return nil, claimNone, err
 	}
-	defer tx.Rollback(ctx)
-
-	q := `SELECT cl.campaign_id, cl.lead_id, cl.user_id, c.steps, l.profile_url
-	        FROM campaign_leads cl
-	        JOIN campaigns c ON c.id = cl.campaign_id
-	        JOIN leads l ON l.id = cl.lead_id
-	       WHERE c.account_id = $1 AND c.status = 'running' AND cl.state = $2 AND cl.next_action_at <= $3`
-	args := []any{accountID, stateFor(kind), now}
+	var camps []struct {
+		ID         int64            `bson:"_id"`
+		UserID     int64            `bson:"user_id"`
+		Steps      []campaigns.Step `bson:"steps"`
+		DailyLimit int              `bson:"daily_limit"`
+	}
+	if err := cc.All(ctx, &camps); err != nil {
+		return nil, claimNone, err
+	}
+	byID := map[int64]int{}
+	eligible := []int64{}
+	for i, c := range camps {
+		byID[c.ID] = i
+		eligible = append(eligible, c.ID)
+	}
+	if len(eligible) == 0 {
+		return nil, claimNone, nil
+	}
 	if kind == kindConnect {
 		// A campaign's own daily limit applies to its connection requests.
-		q += ` AND (SELECT count(*) FROM send_attempts a
-		             WHERE a.campaign_id = c.id AND a.kind = 'connect'
-		               AND a.created_at >= $4 AND a.created_at < $5
-		               AND a.status IN ('starting','submitted','succeeded','unknown')) < c.daily_limit`
-		args = append(args, dayStart, dayEnd)
+		sent, err := w.attempts().Aggregate(ctx, mongo.Pipeline{
+			{{Key: "$match", Value: bson.D{
+				eq("campaign_id", idsIn(eligible)), eq("kind", kindConnect),
+				eq("created_at", bson.D{{Key: "$gte", Value: dayStart}, {Key: "$lt", Value: dayEnd}}),
+				eq("status", bson.D{{Key: "$in", Value: countedStatuses}}),
+			}}},
+			{{Key: "$group", Value: bson.D{eq("_id", "$campaign_id"), eq("n", bson.D{{Key: "$sum", Value: 1}})}}},
+		})
+		if err != nil {
+			return nil, claimNone, err
+		}
+		var rows []struct {
+			ID int64 `bson:"_id"`
+			N  int   `bson:"n"`
+		}
+		if err := sent.All(ctx, &rows); err != nil {
+			return nil, claimNone, err
+		}
+		today := map[int64]int{}
+		for _, r := range rows {
+			today[r.ID] = r.N
+		}
+		eligible = eligible[:0]
+		for _, c := range camps {
+			if today[c.ID] < c.DailyLimit {
+				eligible = append(eligible, c.ID)
+			}
+		}
+		if len(eligible) == 0 {
+			return nil, claimNone, nil
+		}
 	}
-	q += ` ORDER BY cl.next_action_at, cl.lead_id LIMIT 1 FOR UPDATE OF cl SKIP LOCKED`
 
-	var t toSend
-	var stepsJSON []byte
-	err = tx.QueryRow(ctx, q, args...).Scan(&t.campaignID, &t.leadID, &t.userID, &stepsJSON, &t.profileURL)
-	if errors.Is(err, pgx.ErrNoRows) {
+	// The next due lead of this kind, oldest first.
+	var cand struct {
+		ID         bson.ObjectID `bson:"_id"`
+		CampaignID int64         `bson:"campaign_id"`
+		LeadID     int64         `bson:"lead_id"`
+	}
+	err = w.db.Collection(mdb.CampaignLeads).FindOne(ctx, bson.D{
+		eq("campaign_id", idsIn(eligible)), eq("state", stateFor(kind)), eq("next_action_at", bson.D{{Key: "$lte", Value: now}}),
+	}, options.FindOne().SetSort(bson.D{eq("next_action_at", 1), eq("lead_id", 1)})).Decode(&cand)
+	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil, claimNone, nil
 	}
 	if err != nil {
 		return nil, claimNone, err
 	}
-	steps, err := stepsOf(stepsJSON)
+	camp := camps[byID[cand.CampaignID]]
+	if len(camp.Steps) != 3 {
+		return nil, claimNone, errors.New("stored campaign steps are not the 3-step sequence")
+	}
+	var lead struct {
+		ProfileURL string `bson:"profile_url"`
+	}
+	if err := w.db.Collection(mdb.Leads).FindOne(ctx, bson.D{eq("_id", cand.LeadID)}).Decode(&lead); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, claimStale, nil // the lead was deleted
+		}
+		return nil, claimNone, err
+	}
+
+	t := toSend{profileURL: lead.ProfileURL}
+	switch kind {
+	case kindConnect:
+		t.text = camp.Steps[0].Note
+	case kindMessage:
+		t.text = camp.Steps[1].Body
+	default:
+		t.text = camp.Steps[2].Body
+	}
+	id, err := mdb.NextID(ctx, w.db, mdb.SendAttempts)
 	if err != nil {
 		return nil, claimNone, err
 	}
-	switch kind {
-	case kindConnect:
-		t.text = steps[0].Note
-	case kindMessage:
-		t.text = steps[1].Body
-	default:
-		t.text = steps[2].Body
-	}
-
-	t.accountID, t.kind, t.status, t.createdAt = accountID, kind, statusStarting, now
-	err = tx.QueryRow(ctx,
-		`INSERT INTO send_attempts (user_id, account_id, campaign_id, lead_id, kind, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, 'starting', $6, $6) RETURNING id`,
-		t.userID, accountID, t.campaignID, t.leadID, kind, now).Scan(&t.id)
-	if err != nil {
-		var pg *pgconn.PgError
-		if errors.As(err, &pg) && pg.Code == "23505" {
+	// Record the attempt before anything is sent. The unique index on open attempts lets only
+	// one worker hold an account at a time, which is what keeps two of them off the same lead.
+	if _, err := w.attempts().InsertOne(ctx, attemptDoc{ID: id, UserID: camp.UserID, AccountID: accountID, CampaignID: cand.CampaignID,
+		LeadID: cand.LeadID, Kind: kind, Status: statusStarting, Open: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+		if mdb.IsDup(err) {
 			return nil, claimBusy, nil // another worker already has a task open for this account
 		}
 		return nil, claimNone, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, claimNone, err
+	t.attempt = attempt{id: id, userID: camp.UserID, accountID: accountID, campaignID: cand.CampaignID, leadID: cand.LeadID,
+		kind: kind, status: statusStarting, createdAt: now}
+
+	// Now that we hold the account, check the lead is still waiting for this send. An attempt is
+	// only ever closed after its lead's state has moved on, so whoever held the account before us
+	// has finished with this lead already if it was theirs.
+	n, err := w.db.Collection(mdb.CampaignLeads).CountDocuments(ctx, bson.D{
+		eq("_id", cand.ID), eq("state", stateFor(kind)), eq("next_action_at", bson.D{{Key: "$lte", Value: now}}),
+	})
+	if err != nil || n == 0 {
+		w.closeAttempt(ctx, t.attempt, statusFailed, "the lead changed before it was claimed", now)
+		if err != nil {
+			return nil, claimNone, err
+		}
+		return nil, claimStale, nil
 	}
 	return &t, claimed, nil
 }
@@ -523,9 +650,8 @@ func (w *Worker) send(ctx context.Context, t *toSend, now time.Time) {
 		w.settle(ctx, t.attempt, w.classifyStartError(t.kind, err))
 		return
 	}
-	if _, err := w.pool.Exec(ctx,
-		`UPDATE send_attempts SET status = 'submitted', workflow_id = $1, updated_at = $2 WHERE id = $3 AND status = 'starting'`,
-		ws.ID, now, t.id); err != nil {
+	if _, err := w.attempts().UpdateOne(ctx, bson.D{eq("_id", t.id), eq("status", statusStarting)},
+		bson.D{{Key: "$set", Value: bson.D{eq("status", statusSubmitted), eq("workflow_id", ws.ID), eq("updated_at", now)}}}); err != nil {
 		// The workflow exists but we could not note it. The attempt stays 'starting' and is
 		// recovered by the stale-attempt rules, which never blindly resend a message.
 		w.log.Error("mark submitted", "attempt", t.id, "err", err)
@@ -537,12 +663,30 @@ func (w *Worker) send(ctx context.Context, t *toSend, now time.Time) {
 // deferDue moves due leads in the given states, for running campaigns of one account, to
 // `until`. Leads that are not due yet are left alone.
 func (w *Worker) deferDue(ctx context.Context, accountID int64, states []string, until, now time.Time) {
-	if _, err := w.pool.Exec(ctx,
-		`UPDATE campaign_leads cl SET next_action_at = $1, updated_at = $2
-		   FROM campaigns c
-		  WHERE c.id = cl.campaign_id AND c.account_id = $3 AND c.status = 'running'
-		    AND cl.state = ANY($4) AND cl.next_action_at <= $2`,
-		until, now, accountID, states); err != nil {
+	cc, err := w.campaignsColl().Find(ctx, bson.D{eq("account_id", accountID), eq("status", "running")},
+		options.Find().SetProjection(bson.D{eq("_id", 1)}))
+	if err != nil {
+		w.log.Error("defer due leads", "account", accountID, "err", err)
+		return
+	}
+	var camps []struct {
+		ID int64 `bson:"_id"`
+	}
+	if err := cc.All(ctx, &camps); err != nil || len(camps) == 0 {
+		return
+	}
+	campaignIDs := make([]int64, len(camps))
+	for i, c := range camps {
+		campaignIDs[i] = c.ID
+	}
+	stateVals := make(bson.A, len(states))
+	for i, st := range states {
+		stateVals[i] = st
+	}
+	if _, err := w.db.Collection(mdb.CampaignLeads).UpdateMany(ctx, bson.D{
+		eq("campaign_id", idsIn(campaignIDs)), eq("state", bson.D{{Key: "$in", Value: stateVals}}),
+		eq("next_action_at", bson.D{{Key: "$lte", Value: now}}),
+	}, bson.D{{Key: "$set", Value: bson.D{eq("next_action_at", until), eq("updated_at", now)}}}); err != nil {
 		w.log.Error("defer due leads", "account", accountID, "err", err)
 	}
 }
@@ -551,26 +695,39 @@ func (w *Worker) deferDue(ctx context.Context, accountID int64, states []string,
 // reply. It sends nothing to LinkedIn, so it is not limited to working hours.
 func (w *Worker) finishDueLeads(ctx context.Context) {
 	now := w.now()
-	rows, err := w.pool.Query(ctx,
-		`SELECT cl.campaign_id, cl.lead_id FROM campaign_leads cl JOIN campaigns c ON c.id = cl.campaign_id
-		  WHERE c.status = 'running' AND cl.state = 'followed_up' AND cl.next_action_at <= $1
-		  ORDER BY cl.next_action_at LIMIT 200`, now)
+	cc, err := w.campaignsColl().Find(ctx, bson.D{eq("status", "running")}, options.Find().SetProjection(bson.D{eq("_id", 1)}))
 	if err != nil {
 		w.log.Error("list finished leads", "err", err)
 		return
 	}
-	type pair struct{ campaign, lead int64 }
-	var ps []pair
-	for rows.Next() {
-		var p pair
-		if err := rows.Scan(&p.campaign, &p.lead); err == nil {
-			ps = append(ps, p)
-		}
+	var camps []struct {
+		ID int64 `bson:"_id"`
 	}
-	rows.Close()
+	if err := cc.All(ctx, &camps); err != nil || len(camps) == 0 {
+		return
+	}
+	campaignIDs := make([]int64, len(camps))
+	for i, c := range camps {
+		campaignIDs[i] = c.ID
+	}
+	cur, err := w.db.Collection(mdb.CampaignLeads).Find(ctx, bson.D{
+		eq("campaign_id", idsIn(campaignIDs)), eq("state", "followed_up"), eq("next_action_at", bson.D{{Key: "$lte", Value: now}}),
+	}, options.Find().SetSort(bson.D{eq("next_action_at", 1)}).SetLimit(200))
+	if err != nil {
+		w.log.Error("list finished leads", "err", err)
+		return
+	}
+	var ps []struct {
+		CampaignID int64 `bson:"campaign_id"`
+		LeadID     int64 `bson:"lead_id"`
+	}
+	if err := cur.All(ctx, &ps); err != nil {
+		w.log.Error("list finished leads", "err", err)
+		return
+	}
 	for _, p := range ps {
-		if _, _, err := w.rec.Record(ctx, p.campaign, p.lead, campaigns.EvDone, now, ""); err != nil {
-			w.log.Error("finish lead", "campaign", p.campaign, "lead", p.lead, "err", err)
+		if _, _, err := w.rec.Record(ctx, p.CampaignID, p.LeadID, campaigns.EvDone, now, ""); err != nil {
+			w.log.Error("finish lead", "campaign", p.CampaignID, "lead", p.LeadID, "err", err)
 		}
 	}
 }
@@ -589,4 +746,50 @@ func (w *Worker) jitter(s schedule.Schedule, t time.Time, min, max time.Duration
 	w.rngMu.Lock()
 	defer w.rngMu.Unlock()
 	return s.WithJitter(t, min, max, w.rng)
+}
+
+// attemptDoc is one row of the send_attempts collection. Open is true while the attempt is in
+// flight (starting or submitted) and absent afterwards: a unique partial index on it is what
+// allows one LinkedIn task at a time per account.
+type attemptDoc struct {
+	ID         int64      `bson:"_id"`
+	UserID     int64      `bson:"user_id"`
+	AccountID  int64      `bson:"account_id"`
+	CampaignID int64      `bson:"campaign_id"`
+	LeadID     int64      `bson:"lead_id"`
+	Kind       string     `bson:"kind"`
+	Status     string     `bson:"status"`
+	Open       bool       `bson:"open,omitempty"`
+	WorkflowID *string    `bson:"workflow_id,omitempty"`
+	Detail     string     `bson:"detail"`
+	CreatedAt  time.Time  `bson:"created_at"`
+	UpdatedAt  time.Time  `bson:"updated_at"`
+	FinishedAt *time.Time `bson:"finished_at,omitempty"`
+}
+
+func (d attemptDoc) attempt() attempt {
+	a := attempt{id: d.ID, userID: d.UserID, accountID: d.AccountID, campaignID: d.CampaignID, leadID: d.LeadID,
+		kind: d.Kind, status: d.Status, createdAt: d.CreatedAt}
+	if d.WorkflowID != nil {
+		a.workflowID = *d.WorkflowID
+	}
+	return a
+}
+
+// countedStatuses are the attempts that use up a daily cap: failed ones never reached LinkedIn,
+// but "unknown" ones may have.
+var countedStatuses = bson.A{statusStarting, statusSubmitted, statusSucceeded, statusUnknown}
+
+func (w *Worker) attempts() *mongo.Collection      { return w.db.Collection(mdb.SendAttempts) }
+func (w *Worker) campaignsColl() *mongo.Collection { return w.db.Collection(mdb.Campaigns) }
+func (w *Worker) accountsColl() *mongo.Collection  { return w.db.Collection(mdb.Accounts) }
+
+func eq(k string, v any) bson.E { return bson.E{Key: k, Value: v} }
+
+func idsIn(vals []int64) bson.D {
+	a := make(bson.A, len(vals))
+	for i, v := range vals {
+		a[i] = v
+	}
+	return bson.D{{Key: "$in", Value: a}}
 }

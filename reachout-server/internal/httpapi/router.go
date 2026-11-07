@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Pinger is satisfied by *pgxpool.Pool.
+// Pinger is satisfied by mdb.Pinger.
 type Pinger interface {
 	Ping(ctx context.Context) error
 }

@@ -18,7 +18,7 @@ connector.
 STACK (decided)
   Backend:   Go
   Frontend:  React (Vite)
-  Database:  Postgres
+  Database:  MongoDB
   LinkedIn:  Linked API (REST) - https://linkedapi.io/docs
   OAuth:     fosite, inside the Go app
   MCP:       our own MCP server (Streamable HTTP) behind OAuth, used as a
@@ -36,7 +36,7 @@ HOW LINKED API IS USED
 
 ARCHITECTURE
   React FE ----+
-               +--> Go service layer --> Postgres --> Linked API
+               +--> Go service layer --> MongoDB --> Linked API
   Claude/AI ---+    (campaigns, leads,       ^
    via our MCP       scheduler, state)       |
                                        webhooks back
@@ -75,7 +75,7 @@ MVP SCOPE
 
 BUILD PHASES
   1. (optional) Prototype with Linked API's MCP to learn workflow payloads
-  2. Foundation: Go, Postgres, users, linkedin client, schedule package + tests
+  2. Foundation: Go, MongoDB, users, linkedin client, schedule package + tests
   3. Connect flow
   4. Leads and campaigns
   5. Worker (weekday/working-hours scheduler, per-account queue, caps, jitter)
@@ -94,5 +94,5 @@ RISKS / OPEN QUESTIONS
 
 CURRENT STATUS
   Plan finalized. Go is NOT installed on this machine (brew install go).
-  Postgres not checked. Nothing scaffolded yet. Next: phase 2 once Go is
+  MongoDB not checked. Nothing scaffolded yet. Next: phase 2 once Go is
   installed.

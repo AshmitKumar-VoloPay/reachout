@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/ashmit/reachout-server/internal/schedule"
-	"github.com/jackc/pgx/v5"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // Upper bounds protect the LinkedIn account: even if a user types a bigger number the
@@ -60,30 +62,20 @@ func (s *Service) LoadSchedule(ctx context.Context, accountID int64) (schedule.S
 }
 
 func (s *Service) loadSettings(ctx context.Context, accountID int64) (ScheduleSettings, error) {
-	var st ScheduleSettings
-	var days []int16
-	var start, end int
-	var hols []time.Time
-	err := s.pool.QueryRow(ctx,
-		`SELECT timezone, work_days, start_minute, end_minute, holidays, daily_connect_cap, daily_message_cap
-		   FROM account_schedules WHERE account_id = $1`, accountID).
-		Scan(&st.Timezone, &days, &start, &end, &hols, &st.DailyConnectCap, &st.DailyMessageCap)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var d accountDoc
+	err := s.coll().FindOne(ctx, bson.D{eq("_id", accountID)}, options.FindOne().SetProjection(bson.D{eq("schedule", 1)})).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
 		return ScheduleSettings{}, ErrNotFound
 	}
 	if err != nil {
 		return ScheduleSettings{}, err
 	}
-	st.WorkDays = make([]int, len(days))
-	for i, d := range days {
-		st.WorkDays[i] = int(d)
-	}
-	st.Start, st.End = formatMinute(start), formatMinute(end)
-	st.Holidays = make([]string, len(hols))
-	for i, h := range hols {
-		st.Holidays[i] = h.Format("2006-01-02")
-	}
-	return st, nil
+	sc := d.Schedule
+	return ScheduleSettings{
+		Timezone: sc.Timezone, WorkDays: append([]int{}, sc.WorkDays...), Start: formatMinute(sc.StartMinute),
+		End: formatMinute(sc.EndMinute), Holidays: append([]string{}, sc.Holidays...),
+		DailyConnectCap: sc.DailyConnectCap, DailyMessageCap: sc.DailyMessageCap,
+	}, nil
 }
 
 func (s *Service) view(st ScheduleSettings) (ScheduleView, error) {
@@ -107,16 +99,11 @@ func (s *Service) SetSchedule(ctx context.Context, userID, accountID int64, in S
 	}
 	start, _ := parseMinute(st.Start)
 	end, _ := parseMinute(st.End)
-	days := make([]int16, len(st.WorkDays))
-	for i, d := range st.WorkDays {
-		days[i] = int16(d)
-	}
-	_, err = s.pool.Exec(ctx,
-		`UPDATE account_schedules
-		    SET timezone = $2, work_days = $3, start_minute = $4, end_minute = $5,
-		        holidays = $6::text[]::date[], daily_connect_cap = $7, daily_message_cap = $8
-		  WHERE account_id = $1`,
-		accountID, st.Timezone, days, start, end, st.Holidays, st.DailyConnectCap, st.DailyMessageCap)
+	_, err = s.coll().UpdateOne(ctx, bson.D{eq("_id", accountID), eq("user_id", userID)}, bson.D{{Key: "$set", Value: bson.D{
+		eq("schedule.timezone", st.Timezone), eq("schedule.work_days", st.WorkDays), eq("schedule.start_minute", start),
+		eq("schedule.end_minute", end), eq("schedule.holidays", st.Holidays),
+		eq("schedule.daily_connect_cap", st.DailyConnectCap), eq("schedule.daily_message_cap", st.DailyMessageCap),
+	}}})
 	if err != nil {
 		return ScheduleView{}, err
 	}

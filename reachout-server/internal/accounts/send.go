@@ -5,7 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // SendSettings is what the worker needs to decide whether an account may send right now.
@@ -19,29 +20,31 @@ type SendSettings struct {
 }
 
 func (s *Service) SendSettings(ctx context.Context, accountID int64) (SendSettings, error) {
-	var st SendSettings
-	err := s.pool.QueryRow(ctx,
-		`SELECT a.status, sc.daily_connect_cap, sc.daily_message_cap, sc.ramp_started_at, sc.next_send_not_before
-		   FROM linkedin_accounts a JOIN account_schedules sc ON sc.account_id = a.id
-		  WHERE a.id = $1`, accountID).
-		Scan(&st.Status, &st.ConnectCap, &st.MessageCap, &st.RampStart, &st.NotBefore)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var d accountDoc
+	err := s.coll().FindOne(ctx, bson.D{eq("_id", accountID)}).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
 		return SendSettings{}, ErrNotFound
 	}
-	return st, err
+	if err != nil {
+		return SendSettings{}, err
+	}
+	return SendSettings{
+		Status: d.Status, ConnectCap: d.Schedule.DailyConnectCap, MessageCap: d.Schedule.DailyMessageCap,
+		RampStart: d.Schedule.RampStartedAt, NotBefore: d.Schedule.NextSendNotBefore,
+	}, nil
 }
 
 // SetNotBefore records the earliest time the account may send again.
 func (s *Service) SetNotBefore(ctx context.Context, accountID int64, t time.Time) error {
-	_, err := s.pool.Exec(ctx, `UPDATE account_schedules SET next_send_not_before = $1 WHERE account_id = $2`, t, accountID)
+	_, err := s.coll().UpdateOne(ctx, bson.D{eq("_id", accountID)},
+		bson.D{{Key: "$set", Value: bson.D{eq("schedule.next_send_not_before", t)}}})
 	return err
 }
 
 // MarkNeedsAttention flags a connected account the worker found unusable (signed out of
 // LinkedIn, unsupported language). Sending stops until a refresh or reconnect clears it.
 func (s *Service) MarkNeedsAttention(ctx context.Context, accountID int64, status, detail string) error {
-	_, err := s.pool.Exec(ctx,
-		`UPDATE linkedin_accounts SET status = $1, status_detail = $2 WHERE id = $3 AND status = 'connected'`,
-		status, detail, accountID)
+	_, err := s.coll().UpdateOne(ctx, bson.D{eq("_id", accountID), eq("status", StatusConnected)},
+		bson.D{{Key: "$set", Value: bson.D{eq("status", status), eq("status_detail", detail)}}})
 	return err
 }

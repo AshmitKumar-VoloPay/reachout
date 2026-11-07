@@ -17,8 +17,11 @@ import (
 	"github.com/ashmit/reachout-server/internal/auth"
 	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/testdb"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 type clock struct {
@@ -37,7 +40,7 @@ type sentAction struct {
 
 type env struct {
 	t     *testing.T
-	pool  *pgxpool.Pool
+	db    *mongo.Database
 	fake  *linkedin.Fake
 	accts *accounts.Service
 	camps *campaigns.Service
@@ -62,15 +65,15 @@ func actionError(typ string) linkedin.WorkflowResult {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	pool := testdb.New(t)
+	db := testdb.New(t)
 	key := make([]byte, 32)
 	rand.Read(key)
 	c, _ := accounts.NewCipher(key)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fake := linkedin.NewFake()
-	accts := accounts.NewService(pool, fake, c, log)
-	e := &env{t: t, pool: pool, fake: fake, accts: accts, camps: campaigns.NewService(pool, accts, log),
-		auth: auth.NewService(pool), clock: &clock{}, byID: map[string]sentAction{}, results: func(sentAction) linkedin.WorkflowResult { return ok() }}
+	accts := accounts.NewService(db, fake, c, log)
+	e := &env{t: t, db: db, fake: fake, accts: accts, camps: campaigns.NewService(db, accts, log),
+		auth: auth.NewService(db), clock: &clock{}, byID: map[string]sentAction{}, results: func(sentAction) linkedin.WorkflowResult { return ok() }}
 
 	fake.Workflow = func(token string, action map[string]any) (linkedin.WorkflowStart, error) {
 		e.mu.Lock()
@@ -112,7 +115,7 @@ func testConfig() Config {
 
 func (e *env) worker(cfg Config) *Worker {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	w := New(e.pool, e.accts, e.camps, e.fake, cfg, log)
+	w := New(e.db, e.accts, e.camps, e.fake, cfg, log)
 	w.now = e.clock.Now
 	w.rng = mrand.New(mrand.NewSource(1))
 	return w
@@ -160,20 +163,23 @@ func (e *env) account(u user) int64 {
 // account. Most tests start with them on, so only the sync tests meet the gate.
 func (e *env) markSynced(accountID int64, on bool) {
 	e.t.Helper()
-	q := `UPDATE linkedin_accounts SET network_synced_at = NULL, inbox_synced_at = NULL WHERE id = $1`
+	update := bson.D{{Key: "$unset", Value: bson.D{{Key: "network_synced_at", Value: ""}, {Key: "inbox_synced_at", Value: ""}}}}
 	if on {
-		q = `UPDATE linkedin_accounts SET network_synced_at = '2020-01-01', inbox_synced_at = '2020-01-01' WHERE id = $1`
+		long := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		update = bson.D{{Key: "$set", Value: bson.D{{Key: "network_synced_at", Value: long}, {Key: "inbox_synced_at", Value: long}}}}
 	}
-	if _, err := e.pool.Exec(context.Background(), q, accountID); err != nil {
+	if _, err := e.db.Collection(mdb.Accounts).UpdateOne(context.Background(), bson.D{{Key: "_id", Value: accountID}}, update); err != nil {
 		e.t.Fatal(err)
 	}
 }
 
 func (e *env) rampStart(accountID int64, date string) {
 	e.t.Helper()
-	if _, err := e.pool.Exec(context.Background(), `UPDATE account_schedules SET ramp_started_at = $1::date WHERE account_id = $2`, date, accountID); err != nil {
+	d, err := time.Parse("2006-01-02", date)
+	if err != nil {
 		e.t.Fatal(err)
 	}
+	testdb.Update(e.t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: accountID}}, bson.D{{Key: "schedule.ramp_started_at", Value: d}})
 }
 
 func (e *env) caps(u user, accountID int64, connect, message int, holidays ...string) {
@@ -210,11 +216,14 @@ func (e *env) campaign(u user, accountID int64, prefix string, n, dailyLimit int
 	}
 	ids := make([]int64, n)
 	for i := range ids {
-		err := e.pool.QueryRow(ctx, `INSERT INTO leads (user_id, profile_url, name) VALUES ($1, $2, $3) RETURNING id`,
-			u.id, leadURL(prefix, i), fmt.Sprintf("%s %d", prefix, i)).Scan(&ids[i])
+		id, err := mdb.NextID(ctx, e.db, mdb.Leads)
 		if err != nil {
 			e.t.Fatal(err)
 		}
+		testdb.Insert(e.t, e.db, mdb.Leads, bson.D{{Key: "_id", Value: id}, {Key: "user_id", Value: u.id},
+			{Key: "profile_url", Value: leadURL(prefix, i)}, {Key: "name", Value: fmt.Sprintf("%s %d", prefix, i)},
+			{Key: "headline", Value: ""}, {Key: "company", Value: ""}, {Key: "created_at", Value: time.Now()}})
+		ids[i] = id
 	}
 	if _, err := e.camps.AddLeads(ctx, u.id, c.ID, ids); err != nil {
 		e.t.Fatal(err)
@@ -233,11 +242,9 @@ func leadURL(prefix string, i int) string {
 // setDue makes every unfinished lead of the campaign due at t.
 func (e *env) setDue(campaignID int64, t time.Time) {
 	e.t.Helper()
-	if _, err := e.pool.Exec(context.Background(),
-		`UPDATE campaign_leads SET next_action_at = $1 WHERE campaign_id = $2 AND state IN ('queued','connected','messaged','followed_up')`,
-		t, campaignID); err != nil {
-		e.t.Fatal(err)
-	}
+	testdb.Update(e.t, e.db, mdb.CampaignLeads, bson.D{{Key: "campaign_id", Value: campaignID},
+		{Key: "state", Value: bson.D{{Key: "$in", Value: bson.A{"queued", "connected", "messaged", "followed_up"}}}}},
+		bson.D{{Key: "next_action_at", Value: t}})
 }
 
 type leadInfo struct {
@@ -248,50 +255,95 @@ type leadInfo struct {
 	step    int
 }
 
+// clRow is a lead's place in a campaign, read straight from the database.
+type clRow struct {
+	CampaignID   int64      `bson:"campaign_id"`
+	LeadID       int64      `bson:"lead_id"`
+	State        string     `bson:"state"`
+	NextActionAt *time.Time `bson:"next_action_at"`
+	RetryCount   int        `bson:"retry_count"`
+	LastError    string     `bson:"last_error"`
+	CurrentStep  int        `bson:"current_step"`
+}
+
 func (e *env) lead(campaignID, leadID int64) leadInfo {
 	e.t.Helper()
-	var l leadInfo
-	err := e.pool.QueryRow(context.Background(),
-		`SELECT state, next_action_at, retry_count, coalesce(last_error, ''), current_step FROM campaign_leads WHERE campaign_id = $1 AND lead_id = $2`,
-		campaignID, leadID).Scan(&l.state, &l.due, &l.retries, &l.lastErr, &l.step)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	return l
+	r := testdb.One[clRow](e.t, e.db, mdb.CampaignLeads, bson.D{{Key: "campaign_id", Value: campaignID}, {Key: "lead_id", Value: leadID}})
+	return leadInfo{state: campaigns.State(r.State), due: r.NextActionAt, retries: r.RetryCount, lastErr: r.LastError, step: r.CurrentStep}
 }
 
 func (e *env) attemptCounts(accountID int64) map[string]int {
 	e.t.Helper()
-	rows, err := e.pool.Query(context.Background(), `SELECT status, count(*) FROM send_attempts WHERE account_id = $1 GROUP BY status`, accountID)
+	cur, err := e.db.Collection(mdb.SendAttempts).Find(context.Background(), bson.D{{Key: "account_id", Value: accountID}})
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	defer rows.Close()
+	var docs []attemptDoc
+	if err := cur.All(context.Background(), &docs); err != nil {
+		e.t.Fatal(err)
+	}
 	m := map[string]int{}
-	for rows.Next() {
-		var s string
-		var n int
-		rows.Scan(&s, &n)
-		m[s] = n
+	for _, d := range docs {
+		m[d.Status]++
 	}
 	return m
 }
 
 func (e *env) stateCounts(campaignID int64) map[campaigns.State]int {
 	e.t.Helper()
-	rows, err := e.pool.Query(context.Background(), `SELECT state, count(*) FROM campaign_leads WHERE campaign_id = $1 GROUP BY state`, campaignID)
+	cur, err := e.db.Collection(mdb.CampaignLeads).Find(context.Background(), bson.D{{Key: "campaign_id", Value: campaignID}})
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	defer rows.Close()
+	var rows []clRow
+	if err := cur.All(context.Background(), &rows); err != nil {
+		e.t.Fatal(err)
+	}
 	m := map[campaigns.State]int{}
-	for rows.Next() {
-		var s campaigns.State
-		var n int
-		rows.Scan(&s, &n)
-		m[s] = n
+	for _, r := range rows {
+		m[campaigns.State(r.State)]++
 	}
 	return m
+}
+
+// attemptDocs returns the send attempts matching filter, oldest first.
+func (e *env) attemptDocs(filter bson.D) []attemptDoc {
+	e.t.Helper()
+	cur, err := e.db.Collection(mdb.SendAttempts).Find(context.Background(), filter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var docs []attemptDoc
+	if err := cur.All(context.Background(), &docs); err != nil {
+		e.t.Fatal(err)
+	}
+	return docs
+}
+
+type messageRow struct {
+	Direction string `bson:"direction"`
+	Body      string `bson:"body"`
+}
+
+// messages returns a lead's stored conversation, oldest first.
+func (e *env) messages(leadID int64) []messageRow {
+	e.t.Helper()
+	cur, err := e.db.Collection(mdb.Messages).Find(context.Background(), bson.D{{Key: "lead_id", Value: leadID}}, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var rows []messageRow
+	if err := cur.All(context.Background(), &rows); err != nil {
+		e.t.Fatal(err)
+	}
+	return rows
+}
+
+func (e *env) accountStatus(accountID int64) string {
+	e.t.Helper()
+	return testdb.One[struct {
+		Status string `bson:"status"`
+	}](e.t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: accountID}}).Status
 }
 
 func utc(y int, m time.Month, d, h, min int) time.Time {

@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/ashmit/reachout-server/internal/linkedin"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ashmit/reachout-server/internal/mdb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // Reconciler asks Linked API to deliver again the events it gave up on (after its own 8
@@ -16,21 +18,21 @@ import (
 // never to LinkedIn, so it is safe to run at any hour. Replays reuse the original event id,
 // so the endpoint's de-duplication makes them harmless.
 type Reconciler struct {
-	pool *pgxpool.Pool
-	li   linkedin.Client
-	log  *slog.Logger
-	now  func() time.Time
+	db  *mongo.Database
+	li  linkedin.Client
+	log *slog.Logger
+	now func() time.Time
 
 	MaxReplays  int           // times one delivery is replayed before we stop asking
 	MinInterval time.Duration // gap between replays of the same delivery
 	Retention   time.Duration // how long webhook_events rows are kept for de-duplication
 }
 
-func NewReconciler(pool *pgxpool.Pool, li linkedin.Client, log *slog.Logger) *Reconciler {
+func NewReconciler(db *mongo.Database, li linkedin.Client, log *slog.Logger) *Reconciler {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Reconciler{pool: pool, li: li, log: log, now: time.Now,
+	return &Reconciler{db: db, li: li, log: log, now: time.Now,
 		MaxReplays: 3, MinInterval: 10 * time.Minute, Retention: 14 * 24 * time.Hour}
 }
 
@@ -67,21 +69,28 @@ func (r *Reconciler) Once(ctx context.Context) (int, error) {
 			continue
 		}
 		// Already handled here (a later delivery got through): nothing to ask for.
-		var processed *time.Time
-		err := r.pool.QueryRow(ctx, `SELECT processed_at FROM webhook_events WHERE event_id = $1`, d.EventID).Scan(&processed)
-		if err == nil && processed != nil {
+		var seen struct {
+			ProcessedAt *time.Time `bson:"processed_at"`
+		}
+		err := r.db.Collection(mdb.WebhookEvents).FindOne(ctx, bson.D{eq("_id", d.EventID)}).Decode(&seen)
+		if err == nil && seen.ProcessedAt != nil {
 			continue
 		}
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
 			return replayed, err
 		}
 
 		var count int
 		var last time.Time
-		err = r.pool.QueryRow(ctx, `SELECT replays, last_replayed_at FROM webhook_replays WHERE delivery_id = $1`, d.ID).Scan(&count, &last)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		var prior struct {
+			Replays        int       `bson:"replays"`
+			LastReplayedAt time.Time `bson:"last_replayed_at"`
+		}
+		err = r.db.Collection(mdb.WebhookReplays).FindOne(ctx, bson.D{eq("_id", d.ID)}).Decode(&prior)
+		if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
 			return replayed, err
 		}
+		count, last = prior.Replays, prior.LastReplayedAt
 		if count >= r.MaxReplays || (count > 0 && now.Sub(last) < r.MinInterval) {
 			continue
 		}
@@ -89,10 +98,10 @@ func (r *Reconciler) Once(ctx context.Context) (int, error) {
 			r.log.Warn("replay delivery", "delivery", d.ID, "err", err)
 			continue
 		}
-		if _, err := r.pool.Exec(ctx,
-			`INSERT INTO webhook_replays (delivery_id, replays, last_replayed_at) VALUES ($1, 1, $2)
-			 ON CONFLICT (delivery_id) DO UPDATE SET replays = webhook_replays.replays + 1, last_replayed_at = $2`,
-			d.ID, now); err != nil {
+		if _, err := r.db.Collection(mdb.WebhookReplays).UpdateOne(ctx, bson.D{eq("_id", d.ID)}, bson.D{
+			{Key: "$inc", Value: bson.D{eq("replays", 1)}},
+			{Key: "$set", Value: bson.D{eq("last_replayed_at", now)}},
+		}, options.UpdateOne().SetUpsert(true)); err != nil {
 			return replayed, err
 		}
 		replayed++
@@ -103,10 +112,10 @@ func (r *Reconciler) Once(ctx context.Context) (int, error) {
 // prune forgets old de-duplication rows. Linked API stops retrying within hours, so two
 // weeks is far more than needed.
 func (r *Reconciler) prune(ctx context.Context, now time.Time) {
-	if _, err := r.pool.Exec(ctx, `DELETE FROM webhook_events WHERE received_at < $1`, now.Add(-r.Retention)); err != nil {
+	if _, err := r.db.Collection(mdb.WebhookEvents).DeleteMany(ctx, bson.D{eq("received_at", bson.D{{Key: "$lt", Value: now.Add(-r.Retention)}})}); err != nil {
 		r.log.Warn("prune webhook events", "err", err)
 	}
-	if _, err := r.pool.Exec(ctx, `DELETE FROM webhook_replays WHERE last_replayed_at < $1`, now.Add(-2*r.Retention)); err != nil {
+	if _, err := r.db.Collection(mdb.WebhookReplays).DeleteMany(ctx, bson.D{eq("last_replayed_at", bson.D{{Key: "$lt", Value: now.Add(-2 * r.Retention)}})}); err != nil {
 		r.log.Warn("prune webhook replays", "err", err)
 	}
 }

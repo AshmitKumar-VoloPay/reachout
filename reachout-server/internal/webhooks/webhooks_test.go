@@ -20,8 +20,11 @@ import (
 	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/httpapi"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/testdb"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // The secret and vectors are the ones in Linked API's signature documentation.
@@ -101,7 +104,7 @@ func (f *flakyRecorder) Record(ctx context.Context, c, l int64, ev campaigns.Eve
 
 type env struct {
 	t     *testing.T
-	pool  *pgxpool.Pool
+	db    *mongo.Database
 	camps *campaigns.Service
 	accts *accounts.Service
 	auth  *auth.Service
@@ -116,19 +119,19 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	pool := testdb.New(t)
+	db := testdb.New(t)
 	key := make([]byte, 32)
 	rand.Read(key)
 	c, _ := accounts.NewCipher(key)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fake := linkedin.NewFake()
-	accts := accounts.NewService(pool, fake, c, log)
-	camps := campaigns.NewService(pool, accts, log)
-	e := &env{t: t, pool: pool, camps: camps, accts: accts, auth: auth.NewService(pool), fake: fake,
+	accts := accounts.NewService(db, fake, c, log)
+	camps := campaigns.NewService(db, accts, log)
+	e := &env{t: t, db: db, camps: camps, accts: accts, auth: auth.NewService(db), fake: fake,
 		rec: &flakyRecorder{inner: camps}, now: time.Date(2026, 11, 10, 10, 5, 0, 0, time.UTC)}
-	e.h = New(pool, e.rec, docSecret, log)
+	e.h = New(db, e.rec, docSecret, log)
 	e.h.now = func() time.Time { return e.now }
-	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: pool, Log: log, AllowedOrigins: []string{"http://localhost:5173"}})
+	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: mdb.Pinger{DB: db}, Log: log, AllowedOrigins: []string{"http://localhost:5173"}})
 	e.h.Register(mux)
 	e.srv = handler
 	return e
@@ -179,10 +182,12 @@ func (e *env) lead(o owner, slug string, state campaigns.State) lead {
 		e.t.Fatal(err)
 	}
 	url := "https://www.linkedin.com/in/" + slug
-	var id int64
-	if err := e.pool.QueryRow(ctx, `INSERT INTO leads (user_id, profile_url, name) VALUES ($1, $2, $3) RETURNING id`, o.userID, url, slug).Scan(&id); err != nil {
+	id, err := mdb.NextID(ctx, e.db, mdb.Leads)
+	if err != nil {
 		e.t.Fatal(err)
 	}
+	testdb.Insert(e.t, e.db, mdb.Leads, bson.D{{Key: "_id", Value: id}, {Key: "user_id", Value: o.userID}, {Key: "profile_url", Value: url},
+		{Key: "name", Value: slug}, {Key: "headline", Value: ""}, {Key: "company", Value: ""}, {Key: "created_at", Value: time.Now()}})
 	if _, err := e.camps.AddLeads(ctx, o.userID, c.ID, []int64{id}); err != nil {
 		e.t.Fatal(err)
 	}
@@ -205,23 +210,41 @@ func (e *env) lead(o owner, slug string, state campaigns.State) lead {
 
 func (e *env) state(l lead) (campaigns.State, *time.Time, int) {
 	e.t.Helper()
-	var s campaigns.State
-	var due *time.Time
-	var step int
-	if err := e.pool.QueryRow(context.Background(),
-		`SELECT state, next_action_at, current_step FROM campaign_leads WHERE campaign_id = $1 AND lead_id = $2`, l.campaign, l.id).Scan(&s, &due, &step); err != nil {
-		e.t.Fatal(err)
-	}
-	return s, due, step
+	d := testdb.One[struct {
+		State        campaigns.State `bson:"state"`
+		NextActionAt *time.Time      `bson:"next_action_at"`
+		CurrentStep  int             `bson:"current_step"`
+	}](e.t, e.db, mdb.CampaignLeads, bson.D{{Key: "campaign_id", Value: l.campaign}, {Key: "lead_id", Value: l.id}})
+	return d.State, d.NextActionAt, d.CurrentStep
 }
 
-func (e *env) count(q string, args ...any) int {
+func (e *env) count(coll string, filter bson.D) int {
 	e.t.Helper()
-	var n int
-	if err := e.pool.QueryRow(context.Background(), q, args...).Scan(&n); err != nil {
+	return testdb.Count(e.t, e.db, coll, filter)
+}
+
+func leadFilter(id int64) bson.D { return bson.D{{Key: "lead_id", Value: id}} }
+
+var processed = bson.D{{Key: "processed_at", Value: bson.D{{Key: "$exists", Value: true}}}}
+
+// messages returns a lead's stored conversation, oldest first.
+func (e *env) messages(leadID int64) []struct {
+	Direction string `bson:"direction"`
+	Body      string `bson:"body"`
+} {
+	e.t.Helper()
+	cur, err := e.db.Collection(mdb.Messages).Find(context.Background(), leadFilter(leadID), options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}))
+	if err != nil {
 		e.t.Fatal(err)
 	}
-	return n
+	var rows []struct {
+		Direction string `bson:"direction"`
+		Body      string `bson:"body"`
+	}
+	if err := cur.All(context.Background(), &rows); err != nil {
+		e.t.Fatal(err)
+	}
+	return rows
 }
 
 // event builds an event body.
@@ -303,7 +326,7 @@ func TestBadRequestsAreRejectedAndStoreNothing(t *testing.T) {
 		t.Errorf("tampered body: %d", rec.Code)
 	}
 	// None of that stored an event or changed a lead.
-	if n := e.count(`SELECT count(*) FROM webhook_events`); n != 0 {
+	if n := e.count(mdb.WebhookEvents, bson.D{}); n != 0 {
 		t.Fatalf("%d events stored from rejected requests", n)
 	}
 	if s, _, _ := e.state(l); s != campaigns.StateRequestSent {
@@ -318,7 +341,7 @@ func TestBadRequestsAreRejectedAndStoreNothing(t *testing.T) {
 func TestEndpointNeedsASecretAndSaneInput(t *testing.T) {
 	e := newEnv(t)
 	body := []byte(vector1)
-	noSecret := New(e.pool, e.rec, "", nil)
+	noSecret := New(e.db, e.rec, "", nil)
 	noSecret.now = func() time.Time { return time.Unix(1700000000, 0) }
 	mux := http.NewServeMux()
 	noSecret.Register(mux)
@@ -340,7 +363,7 @@ func TestEndpointNeedsASecretAndSaneInput(t *testing.T) {
 			t.Errorf("%s: %d", name, rec.Code)
 		}
 	}
-	if n := e.count(`SELECT count(*) FROM webhook_events`); n != 0 {
+	if n := e.count(mdb.WebhookEvents, bson.D{}); n != 0 {
 		t.Fatalf("%d events stored for malformed input", n)
 	}
 	// Oversized bodies are refused before any signature work.
@@ -398,20 +421,18 @@ func TestReplyStopsTheSequenceAndIsStored(t *testing.T) {
 	if s != campaigns.StateReplied || due != nil || step != 3 {
 		t.Fatalf("state %s due %v step %d", s, due, step)
 	}
-	var dir, body string
-	e.pool.QueryRow(context.Background(), `SELECT direction, body FROM messages WHERE lead_id = $1`, l.id).Scan(&dir, &body)
-	if dir != "in" || body != "Thanks, interested! Call me." {
-		t.Fatalf("stored message: %q %q", dir, body)
+	if msgs := e.messages(l.id); len(msgs) != 1 || msgs[0].Direction != "in" || msgs[0].Body != "Thanks, interested! Call me." {
+		t.Fatalf("stored messages: %+v", msgs)
 	}
 
 	// The same LinkedIn message in a different event is stored once.
 	e.deliver(e.reply(o, "m-1", "Thanks, interested! Call me.", map[string]any{"personPublicUrl": l.url}))
-	if n := e.count(`SELECT count(*) FROM messages WHERE lead_id = $1`, l.id); n != 1 {
+	if n := e.count(mdb.Messages, leadFilter(l.id)); n != 1 {
 		t.Fatalf("%d copies of one message", n)
 	}
 	// A second, different message is added; the state stays replied.
 	e.deliver(e.reply(o, "m-2", "Also, my number is...", map[string]any{"personPublicUrl": l.url}))
-	if n := e.count(`SELECT count(*) FROM messages WHERE lead_id = $1`, l.id); n != 2 {
+	if n := e.count(mdb.Messages, leadFilter(l.id)); n != 2 {
 		t.Fatalf("%d messages", n)
 	}
 	if s, _, _ := e.state(l); s != campaigns.StateReplied {
@@ -439,7 +460,7 @@ func TestOnlyInboundMessagesFromOurLeadsAreStored(t *testing.T) {
 	e.deliver(e.reply(o, "m-1", "from us", map[string]any{"personPublicUrl": l.url, "sender": "us"}))
 	e.deliver(e.reply(o, "m-2", "from a stranger", map[string]any{"personPublicUrl": "https://www.linkedin.com/in/stranger"}))
 	e.deliver(e.reply(o, "m-3", "no identity at all", map[string]any{}))
-	if n := e.count(`SELECT count(*) FROM messages`); n != 0 {
+	if n := e.count(mdb.Messages, bson.D{}); n != 0 {
 		t.Fatalf("%d messages stored, want none", n)
 	}
 	if s, _, _ := e.state(l); s != campaigns.StateMessaged {
@@ -465,7 +486,7 @@ func TestDuplicateDeliveryChangesNothing(t *testing.T) {
 	if _, due2, _ := e.state(l); due2 == nil || !due2.Equal(*due1) {
 		t.Fatalf("a replay changed the due time: %v -> %v", due1, due2)
 	}
-	if n := e.count(`SELECT count(*) FROM webhook_events`); n != 1 {
+	if n := e.count(mdb.WebhookEvents, bson.D{}); n != 1 {
 		t.Fatalf("%d event rows", n)
 	}
 
@@ -475,7 +496,7 @@ func TestDuplicateDeliveryChangesNothing(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		e.deliver(reply)
 	}
-	if n := e.count(`SELECT count(*) FROM messages WHERE lead_id = $1`, l2.id); n != 1 {
+	if n := e.count(mdb.Messages, leadFilter(l2.id)); n != 1 {
 		t.Fatalf("%d messages after replays", n)
 	}
 }
@@ -493,7 +514,7 @@ func TestAFailedAttemptIsHandledAgainOnRetry(t *testing.T) {
 	if s, _, _ := e.state(l); s != campaigns.StateRequestSent {
 		t.Fatalf("state %s", s)
 	}
-	if n := e.count(`SELECT count(*) FROM webhook_events WHERE processed_at IS NOT NULL`); n != 0 {
+	if n := e.count(mdb.WebhookEvents, processed); n != 0 {
 		t.Fatal("an event whose handling failed was marked processed")
 	}
 
@@ -505,7 +526,7 @@ func TestAFailedAttemptIsHandledAgainOnRetry(t *testing.T) {
 	if s, _, _ := e.state(l); s != campaigns.StateConnected {
 		t.Fatalf("retry did not apply the event: %s", s)
 	}
-	if n := e.count(`SELECT count(*) FROM webhook_events WHERE processed_at IS NOT NULL`); n != 1 {
+	if n := e.count(mdb.WebhookEvents, processed); n != 1 {
 		t.Fatal("event not marked processed after the retry")
 	}
 }
@@ -554,9 +575,9 @@ func TestAccountStatusEventsApplyNewestFirstWins(t *testing.T) {
 	e := newEnv(t)
 	o := e.owner("a@example.com")
 	statusOf := func() string {
-		var s string
-		e.pool.QueryRow(context.Background(), `SELECT status FROM linkedin_accounts WHERE id = $1`, o.accountID).Scan(&s)
-		return s
+		return testdb.One[struct {
+			Status string `bson:"status"`
+		}](t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: o.accountID}}).Status
 	}
 	send := func(typ string, at time.Time) {
 		e.deliver(e.event(e.nextID(), typ, at, map[string]any{"accountId": o.linkedID, "status": "x"}))
@@ -589,7 +610,8 @@ func TestAccountStatusEventsApplyNewestFirstWins(t *testing.T) {
 	}
 
 	// Accounts that are still connecting or failed to connect are not touched by events.
-	e.pool.Exec(context.Background(), `UPDATE linkedin_accounts SET status = 'error', status_event_at = NULL WHERE id = $1`, o.accountID)
+	e.db.Collection(mdb.Accounts).UpdateOne(context.Background(), bson.D{{Key: "_id", Value: o.accountID}}, bson.D{
+		{Key: "$set", Value: bson.D{{Key: "status", Value: "error"}}}, {Key: "$unset", Value: bson.D{{Key: "status_event_at", Value: ""}}}})
 	send("account.active", utc(2026, 11, 10, 11, 0))
 	if statusOf() != "error" {
 		t.Fatalf("an event overrode a failed connection: %s", statusOf())
@@ -617,7 +639,7 @@ func TestEventsOnlyAffectTheAccountOwnersLeads(t *testing.T) {
 	if s, _, _ := e.state(only); s != campaigns.StateMessaged {
 		t.Fatalf("bob's lead replied via alice's account: %s", s)
 	}
-	if n := e.count(`SELECT count(*) FROM messages WHERE lead_id = $1`, only.id); n != 0 {
+	if n := e.count(mdb.Messages, leadFilter(only.id)); n != 0 {
 		t.Fatal("a message was stored on another user's lead")
 	}
 
@@ -642,8 +664,11 @@ func TestWeLearnOtherNamesForAPerson(t *testing.T) {
 	// First reply names the person every way; a later one only by the hashed URL.
 	e.deliver(e.reply(o, "m-1", "one", map[string]any{
 		"personPublicUrl": l.url, "personHashedUrl": "https://www.linkedin.com/in/ACoAAB123", "personUrn": "urn:li:member:123"}))
-	var urn, hashed *string
-	e.pool.QueryRow(context.Background(), `SELECT linkedin_urn, hashed_url FROM leads WHERE id = $1`, l.id).Scan(&urn, &hashed)
+	ids := testdb.One[struct {
+		URN    *string `bson:"linkedin_urn"`
+		Hashed *string `bson:"hashed_url"`
+	}](t, e.db, mdb.Leads, bson.D{{Key: "_id", Value: l.id}})
+	urn, hashed := ids.URN, ids.Hashed
 	if urn == nil || *urn != "urn:li:member:123" || hashed == nil || *hashed != "https://www.linkedin.com/in/acoaab123" {
 		t.Fatalf("remembered %v %v", urn, hashed)
 	}
@@ -653,12 +678,12 @@ func TestWeLearnOtherNamesForAPerson(t *testing.T) {
 	} {
 		e.deliver(e.reply(o, fmt.Sprintf("later-%d", i), "again", data))
 	}
-	if n := e.count(`SELECT count(*) FROM messages WHERE lead_id = $1`, l.id); n != 3 {
+	if n := e.count(mdb.Messages, leadFilter(l.id)); n != 3 {
 		t.Fatalf("%d messages stored, want 3 (each found by a different identity)", n)
 	}
 	// Acceptance events name people by personUrl or URN too.
 	l2 := e.lead(o, "john-roe", campaigns.StateRequestSent)
-	e.pool.Exec(context.Background(), `UPDATE leads SET linkedin_urn = 'urn:li:member:9' WHERE id = $1`, l2.id)
+	testdb.Update(t, e.db, mdb.Leads, bson.D{{Key: "_id", Value: l2.id}}, bson.D{{Key: "linkedin_urn", Value: "urn:li:member:9"}})
 	e.deliver(e.event(e.nextID(), "network.connectionAccepted", e.now, map[string]any{
 		"accountId": o.linkedID, "personUrn": "urn:li:member:9", "personUrl": "https://www.linkedin.com/in/ACoAAZZZ", "detectedAt": e.now.Format(time.RFC3339)}))
 	if s, _, _ := e.state(l2); s != campaigns.StateConnected {
@@ -680,7 +705,7 @@ func TestOtherEventTypesAreAcknowledgedAndIgnored(t *testing.T) {
 	if s, _, _ := e.state(l); s != campaigns.StateRequestSent {
 		t.Fatalf("an ignored event changed the lead: %s", s)
 	}
-	if n := e.count(`SELECT count(*) FROM webhook_events WHERE processed_at IS NOT NULL`); n != 7 {
+	if n := e.count(mdb.WebhookEvents, processed); n != 7 {
 		t.Fatalf("%d events recorded as handled, want 7", n)
 	}
 }
@@ -692,13 +717,9 @@ func TestMessageTextIsBounded(t *testing.T) {
 	e.deliver(e.reply(o, "m-1", strings.Repeat("é", 25000), map[string]any{"personPublicUrl": l.url}))
 	e.deliver(e.reply(o, "m-2", "   ", map[string]any{"personPublicUrl": l.url}))
 	e.deliver(e.reply(o, "m-3", "<script>alert(1)</script>", map[string]any{"personPublicUrl": l.url}))
-	rows, _ := e.pool.Query(context.Background(), `SELECT body FROM messages WHERE lead_id = $1 ORDER BY id`, l.id)
-	defer rows.Close()
 	var got []string
-	for rows.Next() {
-		var b string
-		rows.Scan(&b)
-		got = append(got, b)
+	for _, m := range e.messages(l.id) {
+		got = append(got, m.Body)
 	}
 	if len(got) != 3 || len([]rune(got[0])) != maxMessageLen || got[1] != "(no text)" || got[2] != "<script>alert(1)</script>" {
 		t.Fatalf("stored bodies: %d %q", len(got), []any{len([]rune(got[0])), got[1], got[2]})
@@ -718,7 +739,7 @@ func TestReconcilerReplaysOnlyWhatWasMissed(t *testing.T) {
 		{ID: "d-pending", EventID: "e-p", Status: "pending"},
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	r := NewReconciler(e.pool, e.fake, log)
+	r := NewReconciler(e.db, e.fake, log)
 	clock := e.now
 	r.now = func() time.Time { return clock }
 
@@ -748,12 +769,14 @@ func TestReconcilerReplaysOnlyWhatWasMissed(t *testing.T) {
 func TestOldDedupeRowsArePruned(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	e.pool.Exec(ctx, `INSERT INTO webhook_events (event_id, received_at) VALUES ('old', $1), ('fresh', $2)`,
-		e.now.Add(-30*24*time.Hour), e.now.Add(-time.Hour))
-	r := NewReconciler(e.pool, e.fake, nil)
+	e.db.Collection(mdb.WebhookEvents).InsertMany(ctx, []any{
+		bson.D{{Key: "_id", Value: "old"}, {Key: "received_at", Value: e.now.Add(-30 * 24 * time.Hour)}},
+		bson.D{{Key: "_id", Value: "fresh"}, {Key: "received_at", Value: e.now.Add(-time.Hour)}},
+	})
+	r := NewReconciler(e.db, e.fake, nil)
 	r.now = func() time.Time { return e.now }
 	r.Once(ctx)
-	if e.count(`SELECT count(*) FROM webhook_events WHERE event_id = 'old'`) != 0 || e.count(`SELECT count(*) FROM webhook_events WHERE event_id = 'fresh'`) != 1 {
+	if e.count(mdb.WebhookEvents, bson.D{{Key: "_id", Value: "old"}}) != 0 || e.count(mdb.WebhookEvents, bson.D{{Key: "_id", Value: "fresh"}}) != 1 {
 		t.Fatal("pruning removed the wrong rows")
 	}
 }

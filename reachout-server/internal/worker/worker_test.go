@@ -14,8 +14,11 @@ import (
 
 	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/schedule"
+	"github.com/ashmit/reachout-server/internal/testdb"
 	"github.com/ashmit/reachout-server/internal/webhooks"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 var longAgo = utc(2026, 11, 2, 8, 0)
@@ -56,9 +59,13 @@ func TestSendsAConnectionRequestInWorkingHours(t *testing.T) {
 	acct2 := e2.account(u2)
 	cc, _ := e2.camps.Create(context.Background(), u2.id, campaigns.Input{AccountID: acct2, Name: "n", DailyLimit: 5,
 		Steps: []campaigns.Step{{Type: campaigns.StepConnect}, steps()[1], steps()[2]}})
-	e2.pool.Exec(context.Background(), `INSERT INTO leads (user_id, profile_url) VALUES ($1, 'https://www.linkedin.com/in/nonote')`, u2.id)
-	var lid int64
-	e2.pool.QueryRow(context.Background(), `SELECT id FROM leads WHERE user_id = $1`, u2.id).Scan(&lid)
+	lid, err := mdb.NextID(context.Background(), e2.db, mdb.Leads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testdb.Insert(t, e2.db, mdb.Leads, bson.D{{Key: "_id", Value: lid}, {Key: "user_id", Value: u2.id},
+		{Key: "profile_url", Value: "https://www.linkedin.com/in/nonote"}, {Key: "name", Value: ""}, {Key: "headline", Value: ""},
+		{Key: "company", Value: ""}, {Key: "created_at", Value: time.Now()}})
 	e2.camps.AddLeads(context.Background(), u2.id, cc.ID, []int64{lid})
 	e2.camps.Start(context.Background(), u2.id, cc.ID)
 	e2.setDue(cc.ID, longAgo)
@@ -202,16 +209,10 @@ func TestCampaignDailyLimitIsSeparateFromTheAccountCap(t *testing.T) {
 	w := e.worker(testConfig())
 
 	perCampaign := func(d int) map[int64]int {
-		rows, _ := e.pool.Query(context.Background(),
-			`SELECT campaign_id, count(*) FROM send_attempts WHERE kind = 'connect' AND created_at >= $1 AND created_at < $2 GROUP BY campaign_id`,
-			day(d), day(d+1))
-		defer rows.Close()
 		m := map[int64]int{}
-		for rows.Next() {
-			var id int64
-			var n int
-			rows.Scan(&id, &n)
-			m[id] = n
+		for _, a := range e.attemptDocs(bson.D{{Key: "kind", Value: "connect"},
+			{Key: "created_at", Value: bson.D{{Key: "$gte", Value: day(d)}, {Key: "$lt", Value: day(d + 1)}}}}) {
+			m[a.CampaignID]++
 		}
 		return m
 	}
@@ -277,10 +278,13 @@ func TestSendsAreSpacedAndStayInsideTheWindow(t *testing.T) {
 	w2 := e2.worker(testConfig())
 	e2.tick(w2, utc(2026, 11, 10, 17, 28))
 	e2.tick(w2, utc(2026, 11, 10, 17, 29))
-	var nb time.Time
-	e2.pool.QueryRow(context.Background(), `SELECT next_send_not_before FROM account_schedules WHERE account_id = $1`, acct2).Scan(&nb)
-	if !nb.Equal(utc(2026, 11, 11, 9, 30)) {
-		t.Fatalf("not-before %v, want Wednesday 09:30", nb)
+	nbDoc := testdb.One[struct {
+		Schedule struct {
+			NotBefore *time.Time `bson:"next_send_not_before"`
+		} `bson:"schedule"`
+	}](t, e2.db, mdb.Accounts, bson.D{{Key: "_id", Value: acct2}})
+	if nb := nbDoc.Schedule.NotBefore; nb == nil || !nb.Equal(utc(2026, 11, 11, 9, 30)) {
+		t.Fatalf("not-before %v, want Wednesday 09:30", nbDoc.Schedule.NotBefore)
 	}
 }
 
@@ -296,14 +300,10 @@ func TestRandomGapsStayWithinBounds(t *testing.T) {
 	for t0 := utc(2026, 11, 10, 9, 0); t0.Before(utc(2026, 11, 10, 18, 0)); t0 = t0.Add(time.Minute) {
 		e.tick(w, t0)
 	}
-	rows, _ := e.pool.Query(context.Background(), `SELECT created_at FROM send_attempts WHERE account_id = $1 ORDER BY id`, acct)
 	var at []time.Time
-	for rows.Next() {
-		var c time.Time
-		rows.Scan(&c)
-		at = append(at, c)
+	for _, a := range e.attemptDocs(bson.D{{Key: "account_id", Value: acct}}) { // oldest first
+		at = append(at, a.CreatedAt)
 	}
-	rows.Close()
 	if len(at) < 10 {
 		t.Fatalf("only %d sends in a working day", len(at))
 	}
@@ -382,14 +382,13 @@ func TestConcurrentWorkersNeverDoubleSend(t *testing.T) {
 			t.Fatalf("round %d: %d sends started at once for one account", round, d)
 		}
 	}
-	rows, _ := e.pool.Query(context.Background(),
-		`SELECT lead_id, count(*) FROM send_attempts WHERE kind = 'connect' AND status IN ('starting','submitted','succeeded') GROUP BY lead_id HAVING count(*) > 1`)
-	defer rows.Close()
-	if rows.Next() {
-		var lead int64
-		var n int
-		rows.Scan(&lead, &n)
-		t.Fatalf("lead %d got %d connection requests", lead, n)
+	perLead := map[int64]int{}
+	for _, a := range e.attemptDocs(bson.D{{Key: "kind", Value: "connect"},
+		{Key: "status", Value: bson.D{{Key: "$in", Value: bson.A{"starting", "submitted", "succeeded"}}}}}) {
+		perLead[a.LeadID]++
+		if perLead[a.LeadID] > 1 {
+			t.Fatalf("lead %d got %d connection requests", a.LeadID, perLead[a.LeadID])
+		}
 	}
 	seen := map[string]bool{}
 	for _, s := range e.sent {
@@ -562,10 +561,9 @@ func TestMessageAndFollowUpFlow(t *testing.T) {
 	if l.state != campaigns.StateMessaged || l.due == nil || !l.due.Equal(utc(2026, 11, 13, 10, 11)) { // +2 business days
 		t.Fatalf("after message: %+v", l)
 	}
-	var body, dir string
-	e.pool.QueryRow(ctx, `SELECT direction, body FROM messages WHERE lead_id = $1`, lead).Scan(&dir, &body)
-	if dir != "out" || body != "Thanks for connecting" {
-		t.Fatalf("stored message: %q %q", dir, body)
+	stored := e.messages(lead)
+	if len(stored) != 1 || stored[0].Direction != "out" || stored[0].Body != "Thanks for connecting" {
+		t.Fatalf("stored messages: %+v", stored)
 	}
 
 	e.tick(w, utc(2026, 11, 13, 10, 30))
@@ -576,14 +574,12 @@ func TestMessageAndFollowUpFlow(t *testing.T) {
 	if l := e.lead(c.id, lead); l.state != campaigns.StateFollowedUp {
 		t.Fatalf("after follow-up: %+v", l)
 	}
-	var n int
-	e.pool.QueryRow(ctx, `SELECT count(*) FROM messages WHERE lead_id = $1 AND direction = 'out'`, lead).Scan(&n)
-	if n != 2 {
+	if n := len(e.messages(lead)); n != 2 {
 		t.Fatalf("%d outbound messages stored, want 2", n)
 	}
 
 	// The final wait ends on a Sunday: finishing the lead sends nothing, so it needs no working hours.
-	e.pool.Exec(ctx, `UPDATE campaign_leads SET next_action_at = $1 WHERE campaign_id = $2`, utc(2026, 11, 13, 11, 0), c.id)
+	testdb.Update(t, e.db, mdb.CampaignLeads, bson.D{{Key: "campaign_id", Value: c.id}}, bson.D{{Key: "next_action_at", Value: utc(2026, 11, 13, 11, 0)}})
 	before := e.sentCount()
 	e.tick(w, utc(2026, 11, 15, 12, 0))
 	if l := e.lead(c.id, lead); l.state != campaigns.StateDone || e.sentCount() != before {
@@ -623,13 +619,13 @@ func TestPausedStoppedAndDisconnectedAreSkipped(t *testing.T) {
 	}
 	e.camps.Resume(ctx, u.id, c.id)
 
-	e.pool.Exec(ctx, `UPDATE linkedin_accounts SET status = 'reconnection_required' WHERE id = $1`, acct)
+	testdb.Update(t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: acct}}, bson.D{{Key: "status", Value: "reconnection_required"}})
 	e.setDue(c.id, longAgo)
 	e.tick(w, at.Add(time.Minute))
 	if e.sentCount() != 0 {
 		t.Fatal("sent for an account that needs reconnecting")
 	}
-	e.pool.Exec(ctx, `UPDATE linkedin_accounts SET status = 'connected' WHERE id = $1`, acct)
+	testdb.Update(t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: acct}}, bson.D{{Key: "status", Value: "connected"}})
 	e.tick(w, at.Add(10*time.Minute))
 	if e.sentCount() != 1 {
 		t.Fatalf("did not resume once reconnected: %d", e.sentCount())
@@ -741,12 +737,12 @@ func TestStaleStartingAttempts(t *testing.T) {
 
 func (e *env) insertAttempt(u user, accountID int64, c camp, kind, status string, at time.Time) {
 	e.t.Helper()
-	_, err := e.pool.Exec(context.Background(),
-		`INSERT INTO send_attempts (user_id, account_id, campaign_id, lead_id, kind, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $7)`, u.id, accountID, c.id, c.leads[0], kind, status, at)
+	id, err := mdb.NextID(context.Background(), e.db, mdb.SendAttempts)
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	testdb.Insert(e.t, e.db, mdb.SendAttempts, attemptDoc{ID: id, UserID: u.id, AccountID: accountID, CampaignID: c.id, LeadID: c.leads[0],
+		Kind: kind, Status: status, Open: status == "starting" || status == "submitted", CreatedAt: at, UpdatedAt: at})
 }
 
 func TestAmbiguousStartErrors(t *testing.T) {
@@ -816,9 +812,7 @@ func TestSignedOutAccountStopsSending(t *testing.T) {
 	e.tick(w, utc(2026, 11, 10, 10, 0))
 	e.tick(w, utc(2026, 11, 10, 10, 1))
 
-	var status string
-	e.pool.QueryRow(context.Background(), `SELECT status FROM linkedin_accounts WHERE id = $1`, acct).Scan(&status)
-	if status != "reconnection_required" {
+	if status := e.accountStatus(acct); status != "reconnection_required" {
 		t.Fatalf("account status %q", status)
 	}
 	if l := e.lead(c.id, c.leads[0]); l.state != campaigns.StateQueued {
@@ -896,9 +890,11 @@ func actionTypes(e *env) []string {
 }
 
 func syncedAt(e *env, accountID int64) (network, inbox bool) {
-	var n, i *time.Time
-	e.pool.QueryRow(context.Background(), `SELECT network_synced_at, inbox_synced_at FROM linkedin_accounts WHERE id = $1`, accountID).Scan(&n, &i)
-	return n != nil, i != nil
+	d := testdb.One[struct {
+		Network *time.Time `bson:"network_synced_at"`
+		Inbox   *time.Time `bson:"inbox_synced_at"`
+	}](e.t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: accountID}})
+	return d.Network != nil, d.Inbox != nil
 }
 
 func TestEventFeedsAreSwitchedOnBeforeAnySend(t *testing.T) {
@@ -1016,9 +1012,7 @@ func TestSignedOutDuringSyncFlagsTheAccount(t *testing.T) {
 	w := e.worker(testConfig())
 	e.tick(w, utc(2026, 11, 10, 10, 0))
 	e.tick(w, utc(2026, 11, 10, 10, 1))
-	var status string
-	e.pool.QueryRow(context.Background(), `SELECT status FROM linkedin_accounts WHERE id = $1`, acct).Scan(&status)
-	if status != "reconnection_required" {
+	if status := e.accountStatus(acct); status != "reconnection_required" {
 		t.Fatalf("status %q", status)
 	}
 }
@@ -1044,7 +1038,7 @@ const hookSecret = "test-webhook-secret"
 // webhook returns a function that delivers an event to the real webhook handler, signed.
 func (e *env) webhook() func(typ string, data map[string]any) int {
 	mux := http.NewServeMux()
-	webhooks.New(e.pool, e.camps, hookSecret, nil).Register(mux)
+	webhooks.New(e.db, e.camps, hookSecret, nil).Register(mux)
 	n := 0
 	return func(typ string, data map[string]any) int {
 		n++
@@ -1061,9 +1055,9 @@ func (e *env) webhook() func(typ string, data map[string]any) int {
 }
 
 func (e *env) linkedInID(accountID int64) string {
-	var id string
-	e.pool.QueryRow(context.Background(), `SELECT linkedin_account_id FROM linkedin_accounts WHERE id = $1`, accountID).Scan(&id)
-	return id
+	return testdb.One[struct {
+		ID string `bson:"linkedin_account_id"`
+	}](e.t, e.db, mdb.Accounts, bson.D{{Key: "_id", Value: accountID}}).ID
 }
 
 func replyData(laID, url string) map[string]any {
@@ -1134,7 +1128,13 @@ func TestAReplyThatArrivesWhileAMessageIsInFlight(t *testing.T) {
 	}
 	// The message really was sent, so it is in the conversation, and the person's reply too.
 	var out, in int
-	e.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE direction = 'out'), count(*) FILTER (WHERE direction = 'in') FROM messages WHERE lead_id = $1`, c.leads[0]).Scan(&out, &in)
+	for _, m := range e.messages(c.leads[0]) {
+		if m.Direction == "out" {
+			out++
+		} else {
+			in++
+		}
+	}
 	if out != 1 || in != 1 {
 		t.Fatalf("messages: %d out, %d in", out, in)
 	}

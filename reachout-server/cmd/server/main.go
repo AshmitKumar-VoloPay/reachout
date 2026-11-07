@@ -11,18 +11,19 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
+
 	"github.com/ashmit/reachout-server/internal/accounts"
 	"github.com/ashmit/reachout-server/internal/auth"
 	"github.com/ashmit/reachout-server/internal/campaigns"
 	"github.com/ashmit/reachout-server/internal/config"
-	"github.com/ashmit/reachout-server/internal/db"
 	"github.com/ashmit/reachout-server/internal/httpapi"
 	"github.com/ashmit/reachout-server/internal/inbox"
 	"github.com/ashmit/reachout-server/internal/leads"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/webhooks"
 	"github.com/ashmit/reachout-server/internal/worker"
-	"github.com/ashmit/reachout-server/migrations"
 )
 
 func main() {
@@ -33,6 +34,8 @@ func main() {
 }
 
 func run() error {
+	// Dev convenience: read .env if present. Variables already set in the environment win, so production is unaffected.
+	_ = godotenv.Load()
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		return err
@@ -49,20 +52,21 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	database, err := mdb.Open(ctx, cfg.MongoURI, cfg.MongoDB)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
+	defer database.Client().Disconnect(context.Background())
 
-	applied, err := db.Migrate(ctx, pool, migrations.FS)
-	if err != nil {
+	// Indexes replace SQL migrations. Several are guarantees the code relies on (one LinkedIn
+	// task at a time per account, one connection in flight), so the server will not start without them.
+	if err := mdb.EnsureIndexes(ctx, database); err != nil {
 		return err
 	}
-	log.Info("migrations", "applied", applied)
+	log.Info("database ready", "db", cfg.MongoDB)
 
-	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: pool, Log: log, AllowedOrigins: cfg.AppOrigins})
-	authH := auth.NewHandler(auth.NewService(pool), auth.Options{CookieSecure: cfg.CookieSecure, Log: log})
+	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: mdb.Pinger{DB: database}, Log: log, AllowedOrigins: cfg.AppOrigins})
+	authH := auth.NewHandler(auth.NewService(database), auth.Options{CookieSecure: cfg.CookieSecure, Log: log})
 	authH.Register(mux)
 
 	cipher, err := accounts.NewCipher(cfg.TokenKey)
@@ -70,27 +74,27 @@ func run() error {
 		return fmt.Errorf("TOKEN_ENCRYPTION_KEY: %w", err)
 	}
 	li := linkedin.NewHTTPClient(cfg.LinkedAPIBaseURL, cfg.LinkedAPIToken)
-	accountsSvc := accounts.NewService(pool, li, cipher, log)
+	accountsSvc := accounts.NewService(database, li, cipher, log)
 	accounts.NewHandler(accountsSvc, authH, log).Register(mux)
-	leads.NewHandler(leads.NewService(pool, li, accountsSvc, log), authH, log).Register(mux)
-	campaignsSvc := campaigns.NewService(pool, accountsSvc, log)
+	leads.NewHandler(leads.NewService(database, li, accountsSvc, log), authH, log).Register(mux)
+	campaignsSvc := campaigns.NewService(database, accountsSvc, log)
 	campaigns.NewHandler(campaignsSvc, authH, log).Register(mux)
 
-	inbox.NewHandler(inbox.NewService(pool), authH, log).Register(mux)
+	inbox.NewHandler(inbox.NewService(database), authH, log).Register(mux)
 
 	// Linked API calls this endpoint when someone accepts a request or replies. It checks the
 	// signature itself, so it sits outside the cookie-based auth.
 	if cfg.WebhookSecret == "" {
 		log.Warn("LINKED_API_WEBHOOK_SECRET is not set: /webhooks/linkedapi will refuse all events, so accepted requests and replies will not be noticed")
 	}
-	webhooks.New(pool, campaignsSvc, cfg.WebhookSecret, log).Register(mux)
-	go webhooks.NewReconciler(pool, li, log).Run(ctx, 10*time.Minute)
+	webhooks.New(database, campaignsSvc, cfg.WebhookSecret, log).Register(mux)
+	go webhooks.NewReconciler(database, li, log).Run(ctx, 10*time.Minute)
 
 	// The worker is the only code that acts on LinkedIn accounts. WORKER_ENABLED=false
 	// leaves the API running but sends nothing.
 	workerCfg := worker.DefaultConfig()
 	workerCfg.Enabled = cfg.WorkerEnabled
-	go worker.New(pool, accountsSvc, campaignsSvc, li, workerCfg, log).Run(ctx)
+	go worker.New(database, accountsSvc, campaignsSvc, li, workerCfg, log).Run(ctx)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,

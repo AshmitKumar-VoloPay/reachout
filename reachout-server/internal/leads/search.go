@@ -9,8 +9,9 @@ import (
 
 	"github.com/ashmit/reachout-server/internal/accounts"
 	"github.com/ashmit/reachout-server/internal/linkedin"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/ashmit/reachout-server/internal/mdb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // importTTL is how long a search import may stay running. Linked API workflows normally
@@ -35,17 +36,32 @@ type Import struct {
 	FinishedAt    *time.Time `json:"finished_at,omitempty"`
 }
 
-const importColumns = `id, account_id, search_url, requested, status, found, imported, duplicates, invalid,
-	over_cap, message, created_at, finished_at`
-
-func scanImport(r rowScanner) (Import, error) {
-	var i Import
-	err := r.Scan(&i.ID, &i.AccountID, &i.SearchURL, &i.Requested, &i.Status, &i.Found, &i.Imported,
-		&i.Duplicates, &i.Invalid, &i.OverCap, &i.Message, &i.CreatedAt, &i.FinishedAt)
-	return i, err
+// importDoc is the stored import.
+type importDoc struct {
+	ID         int64      `bson:"_id"`
+	UserID     int64      `bson:"user_id"`
+	AccountID  int64      `bson:"account_id"`
+	SearchURL  string     `bson:"search_url"`
+	Requested  int        `bson:"requested"`
+	Status     string     `bson:"status"`
+	WorkflowID *string    `bson:"workflow_id,omitempty"`
+	Found      int        `bson:"found"`
+	Imported   int        `bson:"imported"`
+	Duplicates int        `bson:"duplicates"`
+	Invalid    int        `bson:"invalid"`
+	OverCap    int        `bson:"over_cap"`
+	Message    string     `bson:"message"`
+	CreatedAt  time.Time  `bson:"created_at"`
+	FinishedAt *time.Time `bson:"finished_at,omitempty"`
 }
 
-type rowScanner interface{ Scan(dest ...any) error }
+func (d importDoc) imp() Import {
+	return Import{ID: d.ID, AccountID: d.AccountID, SearchURL: d.SearchURL, Requested: d.Requested, Status: d.Status,
+		Found: d.Found, Imported: d.Imported, Duplicates: d.Duplicates, Invalid: d.Invalid, OverCap: d.OverCap,
+		Message: d.Message, CreatedAt: d.CreatedAt, FinishedAt: d.FinishedAt}
+}
+
+func (s *Service) imports() *mongo.Collection { return s.db.Collection(mdb.LeadImports) }
 
 // OutsideWorkingHoursError carries when the account may next run a search.
 type OutsideWorkingHoursError struct{ Next time.Time }
@@ -91,13 +107,16 @@ func (s *Service) StartSearch(ctx context.Context, userID, accountID int64, sear
 		return Import{}, err
 	}
 
-	var id int64
-	err = s.pool.QueryRow(ctx,
-		`INSERT INTO lead_imports (user_id, account_id, search_url, requested) VALUES ($1, $2, $3, $4) RETURNING id`,
-		userID, accountID, searchURL, limit).Scan(&id)
+	id, err := mdb.NextID(ctx, s.db, mdb.LeadImports)
 	if err != nil {
-		var pg *pgconn.PgError
-		if errors.As(err, &pg) && pg.Code == "23505" {
+		return Import{}, err
+	}
+	// The one_running_import_per_acct index lets only one running import exist per account.
+	if _, err := s.imports().InsertOne(ctx, importDoc{
+		ID: id, UserID: userID, AccountID: accountID, SearchURL: searchURL, Requested: limit,
+		Status: "running", CreatedAt: s.now(),
+	}); err != nil {
+		if mdb.IsDup(err) {
 			return Import{}, ErrImportInProgress
 		}
 		return Import{}, err
@@ -112,7 +131,7 @@ func (s *Service) StartSearch(ctx context.Context, userID, accountID int64, sear
 		s.finish(ctx, id, userID, "failed", friendlyError(err))
 		return Import{}, err
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE lead_imports SET workflow_id = $1 WHERE id = $2`, ws.ID, id); err != nil {
+	if _, err := s.imports().UpdateOne(ctx, bson.D{eq("_id", id)}, bson.D{{Key: "$set", Value: bson.D{eq("workflow_id", ws.ID)}}}); err != nil {
 		return Import{}, err
 	}
 	imp, err := s.loadImport(ctx, userID, id)
@@ -120,19 +139,25 @@ func (s *Service) StartSearch(ctx context.Context, userID, accountID int64, sear
 	return imp, err
 }
 
-func (s *Service) loadImport(ctx context.Context, userID, id int64) (Import, error) {
-	imp, err := scanImport(s.pool.QueryRow(ctx,
-		`SELECT `+importColumns+` FROM lead_imports WHERE id = $1 AND user_id = $2`, id, userID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Import{}, ErrNotFound
+func (s *Service) loadDoc(ctx context.Context, userID, id int64) (importDoc, error) {
+	var d importDoc
+	err := s.imports().FindOne(ctx, bson.D{eq("_id", id), eq("user_id", userID)}).Decode(&d)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return importDoc{}, ErrNotFound
 	}
-	return imp, err
+	return d, err
+}
+
+func (s *Service) loadImport(ctx context.Context, userID, id int64) (Import, error) {
+	d, err := s.loadDoc(ctx, userID, id)
+	return d.imp(), err
 }
 
 // GetImport returns an import and, while it is running, checks Linked API for its result.
 // Several browsers polling at once is safe: only one of them completes the import.
 func (s *Service) GetImport(ctx context.Context, userID, id int64) (Import, error) {
-	imp, err := s.loadImport(ctx, userID, id)
+	doc, err := s.loadDoc(ctx, userID, id)
+	imp := doc.imp()
 	if err != nil || imp.Status != "running" {
 		return imp, err
 	}
@@ -140,13 +165,10 @@ func (s *Service) GetImport(ctx context.Context, userID, id int64) (Import, erro
 		s.finish(ctx, id, userID, "failed", "the search took too long and was abandoned")
 		return s.loadImport(ctx, userID, id)
 	}
-	var workflowID string
-	if err := s.pool.QueryRow(ctx, `SELECT coalesce(workflow_id, '') FROM lead_imports WHERE id = $1`, id).Scan(&workflowID); err != nil {
-		return Import{}, err
-	}
-	if workflowID == "" {
+	if doc.WorkflowID == nil {
 		return imp, nil // still being submitted
 	}
+	workflowID := *doc.WorkflowID
 	token, err := s.acc.IdentificationToken(ctx, imp.AccountID)
 	if err != nil {
 		return Import{}, err
@@ -233,23 +255,33 @@ func (s *Service) applySearch(ctx context.Context, userID int64, imp Import, com
 		cands = append(cands, candidate{url: n, name: truncate(it.Name, 200), headline: truncate(it.Headline, 500), urn: urn})
 	}
 
-	err := s.inTx(ctx, userID, func(tx pgx.Tx) error {
-		// Claim the import first: if another poller already completed it, do nothing.
-		tag, err := tx.Exec(ctx,
-			`UPDATE lead_imports SET status = 'completed', finished_at = now() WHERE id = $1 AND user_id = $2 AND status = 'running'`,
-			imp.ID, userID)
+	var first int64
+	if len(cands) > 0 {
+		var err error
+		if first, err = mdb.NextIDs(ctx, s.db, mdb.Leads, len(cands)); err != nil {
+			return Import{}, err
+		}
+	}
+	err := s.inTx(ctx, userID, func(ctx context.Context) error {
+		// Claim the import first: if another poller already completed it, do nothing. The
+		// claim and the new leads commit together, so a crash cannot leave a finished import
+		// with no leads.
+		r, err := s.imports().UpdateOne(ctx, bson.D{eq("_id", imp.ID), eq("user_id", userID), eq("status", "running")},
+			bson.D{{Key: "$set", Value: bson.D{eq("status", "completed"), eq("finished_at", s.now())}}})
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() == 0 {
+		if r.ModifiedCount == 0 {
 			return nil
 		}
-		if err := s.insert(ctx, tx, userID, cands, &res); err != nil {
+		added, err := s.insertTx(ctx, userID, cands, first)
+		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx,
-			`UPDATE lead_imports SET found = $1, imported = $2, duplicates = $3, invalid = $4, over_cap = $5 WHERE id = $6`,
-			len(items), res.Imported, res.Duplicates, len(res.Invalid), res.OverCap, imp.ID)
+		_, err = s.imports().UpdateOne(ctx, bson.D{eq("_id", imp.ID)}, bson.D{{Key: "$set", Value: bson.D{
+			eq("found", len(items)), eq("imported", added.Imported), eq("duplicates", res.Duplicates+added.Duplicates),
+			eq("invalid", len(res.Invalid)), eq("over_cap", added.OverCap),
+		}}})
 		return err
 	})
 	if err != nil {
@@ -259,9 +291,8 @@ func (s *Service) applySearch(ctx context.Context, userID int64, imp Import, com
 }
 
 func (s *Service) finish(ctx context.Context, id, userID int64, status, message string) {
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE lead_imports SET status = $1, message = $2, finished_at = now()
-		  WHERE id = $3 AND user_id = $4 AND status = 'running'`, status, message, id, userID); err != nil {
+	if _, err := s.imports().UpdateOne(ctx, bson.D{eq("_id", id), eq("user_id", userID), eq("status", "running")},
+		bson.D{{Key: "$set", Value: bson.D{eq("status", status), eq("message", message), eq("finished_at", s.now())}}}); err != nil {
 		s.log.Error("finish import", "import", id, "err", err)
 	}
 }

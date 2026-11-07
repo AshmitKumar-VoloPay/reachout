@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -19,13 +20,15 @@ import (
 	"github.com/ashmit/reachout-server/internal/auth"
 	"github.com/ashmit/reachout-server/internal/httpapi"
 	"github.com/ashmit/reachout-server/internal/linkedin"
+	"github.com/ashmit/reachout-server/internal/mdb"
 	"github.com/ashmit/reachout-server/internal/testdb"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 type env struct {
 	t     *testing.T
-	pool  *pgxpool.Pool
+	db    *mongo.Database
 	svc   *Service
 	accts *accounts.Service
 	fake  *linkedin.Fake
@@ -35,22 +38,22 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	pool := testdb.New(t)
+	db := testdb.New(t)
 	key := make([]byte, 32)
 	rand.Read(key)
 	c, _ := accounts.NewCipher(key)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fake := linkedin.NewFake()
-	accts := accounts.NewService(pool, fake, c, log)
-	svc := NewService(pool, fake, accts, log)
+	accts := accounts.NewService(db, fake, c, log)
+	svc := NewService(db, fake, accts, log)
 
-	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: pool, Log: log, AllowedOrigins: []string{"http://localhost:5173"}})
-	aSvc := auth.NewService(pool)
+	mux, handler := httpapi.NewRouter(httpapi.Deps{DB: mdb.Pinger{DB: db}, Log: log, AllowedOrigins: []string{"http://localhost:5173"}})
+	aSvc := auth.NewService(db)
 	ah := auth.NewHandler(aSvc, auth.Options{Log: log})
 	ah.Register(mux)
 	accounts.NewHandler(accts, ah, log).Register(mux)
 	NewHandler(svc, ah, log).Register(mux)
-	return &env{t: t, pool: pool, svc: svc, accts: accts, fake: fake, h: handler, auth: aSvc}
+	return &env{t: t, db: db, svc: svc, accts: accts, fake: fake, h: handler, auth: aSvc}
 }
 
 type user struct {
@@ -122,12 +125,26 @@ func (e *env) setSchedule(u user, accountID int64, holidays []string) {
 	}
 }
 
+// lead finds a user's lead whose profile URL matches the pattern (a regular expression).
+func (e *env) lead(userID int64, urlPattern string) leadDoc {
+	return testdb.One[leadDoc](e.t, e.db, mdb.Leads, bson.D{
+		{Key: "user_id", Value: userID}, {Key: "profile_url", Value: bson.Regex{Pattern: urlPattern}},
+	})
+}
+
+// insertLead stores a lead directly, bypassing the import code.
+func (e *env) insertLead(userID int64, url, name, headline, company string) {
+	id, err := mdb.NextID(context.Background(), e.db, mdb.Leads)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	testdb.Insert(e.t, e.db, mdb.Leads, leadDoc{ID: id, UserID: userID, ProfileURL: url, Name: name, Headline: headline, Company: company, CreatedAt: time.Now()})
+}
+
 func profile(slug string) string { return "https://www.linkedin.com/in/" + slug }
 
 func (e *env) count(userID int64) int {
-	var n int
-	e.pool.QueryRow(context.Background(), `SELECT count(*) FROM leads WHERE user_id = $1`, userID).Scan(&n)
-	return n
+	return testdb.Count(e.t, e.db, mdb.Leads, bson.D{{Key: "user_id", Value: userID}})
 }
 
 func TestImportURLsDedupesAndReports(t *testing.T) {
@@ -171,8 +188,7 @@ func TestImportURLsDedupesAndReports(t *testing.T) {
 	}
 
 	// Stored URLs are the canonical form.
-	var u1 string
-	e.pool.QueryRow(context.Background(), `SELECT profile_url FROM leads WHERE user_id = $1 AND profile_url LIKE '%john%'`, u.id).Scan(&u1)
+	u1 := e.lead(u.id, "john").ProfileURL
 	if u1 != profile("john-roe") {
 		t.Fatalf("stored %q", u1)
 	}
@@ -266,8 +282,7 @@ func TestTenantIsolation(t *testing.T) {
 	if e.count(alice.id) != 2 || e.count(bob.id) != 1 {
 		t.Fatalf("alice %d, bob %d", e.count(alice.id), e.count(bob.id))
 	}
-	var aliceLead int64
-	e.pool.QueryRow(context.Background(), `SELECT id FROM leads WHERE user_id = $1 AND profile_url LIKE '%only-alice'`, alice.id).Scan(&aliceLead)
+	aliceLead := e.lead(alice.id, "only-alice$").ID
 	path := fmt.Sprintf("/api/leads/%d", aliceLead)
 
 	if rec := e.do(bob.cookie, "GET", path, nil); rec.Code != 404 {
@@ -299,13 +314,10 @@ func TestTenantIsolation(t *testing.T) {
 func TestListSearchAndPaging(t *testing.T) {
 	e := newEnv(t)
 	u := e.user("a@example.com")
-	ctx := context.Background()
 	for i := 1; i <= 7; i++ {
-		e.pool.Exec(ctx, `INSERT INTO leads (user_id, profile_url, name, headline, company) VALUES ($1, $2, $3, $4, $5)`,
-			u.id, profile(fmt.Sprintf("person-%d", i)), fmt.Sprintf("Person %d", i), "Engineer", "Acme")
+		e.insertLead(u.id, profile(fmt.Sprintf("person-%d", i)), fmt.Sprintf("Person %d", i), "Engineer", "Acme")
 	}
-	e.pool.Exec(ctx, `INSERT INTO leads (user_id, profile_url, name, headline, company) VALUES ($1, $2, 'Zed 100%', 'CTO', 'Under_Score Inc')`,
-		u.id, profile("zed"))
+	e.insertLead(u.id, profile("zed"), "Zed 100%", "CTO", "Under_Score Inc")
 
 	page := decode[Page](t, e.do(u.cookie, "GET", "/api/leads?limit=3", nil))
 	if page.Total != 8 || len(page.Leads) != 3 || page.Limit != 3 || page.Leads[0].Name != "Zed 100%" {
@@ -431,21 +443,16 @@ func TestSearchImportLifecycle(t *testing.T) {
 	if got.Status != "completed" || got.Found != 5 || got.Imported != 2 || got.Duplicates != 2 || got.Invalid != 1 || got.FinishedAt == nil {
 		t.Fatalf("completed import: %+v", got)
 	}
-	var name, headline string
-	e.pool.QueryRow(context.Background(), `SELECT name, headline FROM leads WHERE user_id = $1 AND profile_url = $2`,
-		u.id, profile("jane-doe")).Scan(&name, &headline)
-	if name != "Jane Doe" || headline != "CTO at Acme" {
-		t.Fatalf("lead data: %q %q", name, headline)
+	jane := e.lead(u.id, "^"+regexp.QuoteMeta(profile("jane-doe"))+"$")
+	if jane.Name != "Jane Doe" || jane.Headline != "CTO at Acme" {
+		t.Fatalf("lead data: %q %q", jane.Name, jane.Headline)
 	}
 	// The person's URN is kept so later events that name them only by URN still find them.
-	var urn *string
-	e.pool.QueryRow(context.Background(), `SELECT linkedin_urn FROM leads WHERE user_id = $1 AND profile_url = $2`, u.id, profile("jane-doe")).Scan(&urn)
-	if urn == nil || *urn != "urn:li:member:jane-doe" {
-		t.Fatalf("urn not stored: %v", urn)
+	if jane.LinkedInURN == nil || *jane.LinkedInURN != "urn:li:member:jane-doe" {
+		t.Fatalf("urn not stored: %v", jane.LinkedInURN)
 	}
 	// The pre-existing blank-name lead was enriched from the search result.
-	e.pool.QueryRow(context.Background(), `SELECT name FROM leads WHERE user_id = $1 AND profile_url = $2`, u.id, profile("existing")).Scan(&name)
-	if name != "Existing" {
+	if name := e.lead(u.id, "^"+regexp.QuoteMeta(profile("existing"))+"$").Name; name != "Existing" {
 		t.Fatalf("existing lead not enriched: %q", name)
 	}
 
@@ -509,9 +516,7 @@ func TestSearchRespectsWorkingHours(t *testing.T) {
 			t.Fatal("a LinkedIn workflow was started outside working hours")
 		}
 	}
-	var n int
-	e.pool.QueryRow(context.Background(), `SELECT count(*) FROM lead_imports`).Scan(&n)
-	if n != 0 {
+	if n := testdb.Count(t, e.db, mdb.LeadImports, bson.D{}); n != 0 {
 		t.Fatalf("%d import rows left behind", n)
 	}
 
@@ -629,7 +634,7 @@ func TestStaleImportIsAbandoned(t *testing.T) {
 	u := e.user("a@example.com")
 	acct := e.connectedAccount(u, "la-1")
 	imp, _ := e.svc.StartSearch(context.Background(), u.id, acct, searchURL, 10)
-	e.pool.Exec(context.Background(), `UPDATE lead_imports SET created_at = now() - interval '21 minutes'`)
+	testdb.Update(t, e.db, mdb.LeadImports, bson.D{}, bson.D{{Key: "created_at", Value: time.Now().Add(-21 * time.Minute)}})
 
 	got, err := e.svc.GetImport(context.Background(), u.id, imp.ID)
 	if err != nil || got.Status != "failed" || !strings.Contains(got.Message, "too long") {

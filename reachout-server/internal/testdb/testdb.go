@@ -1,4 +1,4 @@
-// Package testdb gives tests an isolated, fully migrated Postgres database.
+// Package testdb gives tests an isolated MongoDB database with all indexes created.
 package testdb
 
 import (
@@ -6,64 +6,104 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/ashmit/reachout-server/internal/db"
-	"github.com/ashmit/reachout-server/migrations"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ashmit/reachout-server/internal/mdb"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-// New creates a throwaway database, applies all migrations and returns a pool.
-// The database is dropped when the test ends. If no Postgres is reachable the
-// test is skipped. Set TEST_DATABASE_ADMIN_URL to override the default server.
-func New(t testing.TB) *pgxpool.Pool {
+const defaultURI = "mongodb://localhost:27017/?replicaSet=rs0"
+
+var probe struct {
+	once sync.Once
+	err  error
+}
+
+// New creates a throwaway database and drops it when the test ends. The server comes from
+// TEST_MONGO_URI (it must be a replica set, for transactions). If that variable is set and
+// the server cannot be reached the test fails; only when it is unset and the default local
+// server is absent is the test skipped, so a mistyped URI can never look like a pass.
+func New(t testing.TB) *mongo.Database {
 	t.Helper()
+	uri, explicit := os.LookupEnv("TEST_MONGO_URI")
+	if uri == "" {
+		uri, explicit = defaultURI, false
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	adminDSN := os.Getenv("TEST_DATABASE_ADMIN_URL")
-	if adminDSN == "" {
-		adminDSN = "postgres://localhost:5432/postgres?sslmode=disable"
+	probe.once.Do(func() {
+		pctx, pcancel := context.WithTimeout(ctx, 4*time.Second)
+		defer pcancel()
+		db, err := mdb.Open(pctx, uri, "reachout_probe")
+		if err == nil {
+			db.Client().Disconnect(context.Background())
+		}
+		probe.err = err
+	})
+	if probe.err != nil {
+		if explicit {
+			t.Fatalf("TEST_MONGO_URI is set but mongodb is not reachable: %v", probe.err)
+		}
+		t.Skipf("mongodb not available at %s (set TEST_MONGO_URI): %v", defaultURI, probe.err)
 	}
-	admin, err := pgx.Connect(ctx, adminDSN)
-	if err != nil {
-		t.Skipf("postgres not available: %v", err)
-	}
-	defer admin.Close(ctx)
 
 	var b [6]byte
 	rand.Read(b[:])
-	name := "reachout_test_" + hex.EncodeToString(b[:])
-	if _, err := admin.Exec(ctx, `CREATE DATABASE `+name); err != nil {
-		t.Fatalf("create test db: %v", err)
-	}
-
-	cfg, err := pgxpool.ParseConfig(adminDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.ConnConfig.Database = name
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	db, err := mdb.Open(ctx, uri, "reachout_test_"+hex.EncodeToString(b[:]))
 	if err != nil {
 		t.Fatalf("open test db: %v", err)
 	}
-
 	t.Cleanup(func() {
-		pool.Close()
 		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		a, err := pgx.Connect(c, adminDSN)
-		if err != nil {
-			return
-		}
-		defer a.Close(c)
-		a.Exec(c, `DROP DATABASE IF EXISTS `+name+` WITH (FORCE)`)
+		db.Drop(c)
+		db.Client().Disconnect(c)
 	})
-
-	if _, err := db.Migrate(ctx, pool, migrations.FS); err != nil {
-		t.Fatalf("migrate test db: %v", err)
+	if err := mdb.EnsureIndexes(ctx, db); err != nil {
+		t.Fatalf("create indexes: %v", err)
 	}
-	return pool
+	return db
+}
+
+// Count returns how many documents in coll match filter.
+func Count(t testing.TB, db *mongo.Database, coll string, filter any) int {
+	t.Helper()
+	n, err := db.Collection(coll).CountDocuments(context.Background(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return int(n)
+}
+
+// One decodes the first document in coll matching filter, and fails the test if there is none.
+func One[T any](t testing.TB, db *mongo.Database, coll string, filter any) T {
+	t.Helper()
+	var v T
+	if err := db.Collection(coll).FindOne(context.Background(), filter).Decode(&v); err != nil {
+		t.Fatalf("find in %s: %v", coll, err)
+	}
+	return v
+}
+
+// Insert adds a document, failing the test on error.
+func Insert(t testing.TB, db *mongo.Database, coll string, doc any) {
+	t.Helper()
+	if _, err := db.Collection(coll).InsertOne(context.Background(), doc); err != nil {
+		t.Fatalf("insert into %s: %v", coll, err)
+	}
+}
+
+// Update applies $set-style changes to every document matching filter and returns how many matched.
+func Update(t testing.TB, db *mongo.Database, coll string, filter, set any) int {
+	t.Helper()
+	r, err := db.Collection(coll).UpdateMany(context.Background(), filter, bson.D{{Key: "$set", Value: set}})
+	if err != nil {
+		t.Fatalf("update %s: %v", coll, err)
+	}
+	return int(r.MatchedCount)
 }
